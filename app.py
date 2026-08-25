@@ -199,7 +199,7 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
                             start_dt = shift_start_dt + timedelta(minutes=t)
                             end_dt = start_dt + timedelta(minutes=DURATIONS[b_type])
                             
-                           # Determine label formatting based on duration to fit in the block
+                            # Determine label formatting based on duration to fit in the block
                             duration_mins = DURATIONS[b_type]
                             start_str = start_dt.strftime('%H:%M')
                             end_str = end_dt.strftime('%H:%M')
@@ -226,10 +226,10 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
             # ==========================================
             st.success(f"✅ Schedule Generated! Peak concurrent breaks held at: **{int(pulp.value(max_concurrent))}**")
 
-            # Custom styled title block matching the image
+            # Custom styled title block matching the image with Montserrat font
             st.markdown(
                 f"<div style='background-color: #1c2838; color: white; padding: 12px; border-radius: 4px; "
-                f"text-align: center; font-size: 22px; font-weight: bold; font-family: sans-serif;'>"
+                f"text-align: center; font-size: 22px; font-weight: bold; font-family: Montserrat, sans-serif;'>"
                 f"Shift Break Timetable &bull; {shift_start_str}-{shift_end_str}</div>", 
                 unsafe_allow_html=True
             )
@@ -242,7 +242,7 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
                 text="Bar_Text", color_discrete_map=color_map
             )
             
-         # Put text directly inside the bars and force it to remain horizontal
+            # Put text directly inside the bars and force it to remain horizontal
             fig.update_traces(
                 textposition='inside', 
                 insidetextanchor='middle',
@@ -250,7 +250,7 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
                 textfont=dict(family='Montserrat, sans-serif', color='white', size=10)
             )
 
-           fig.update_layout(
+            fig.update_layout(
                 plot_bgcolor='white',
                 paper_bgcolor='white',
                 font=dict(family='Montserrat, sans-serif', color='black', size=12),
