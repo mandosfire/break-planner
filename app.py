@@ -243,10 +243,11 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
             
             # Put text directly inside the bars
             fig.update_traces(
-                textposition='inside', 
-                insidetextanchor='middle',
-                textfont=dict(color='white', size=11)
-            )
+    textposition='inside', 
+    insidetextanchor='middle',
+    textangle=0, 
+    textfont=dict(color='white', size=9) 
+)
 
             fig.update_layout(
                 plot_bgcolor='white',
