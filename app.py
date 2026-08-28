@@ -199,19 +199,17 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
                             start_dt = shift_start_dt + timedelta(minutes=t)
                             end_dt = start_dt + timedelta(minutes=DURATIONS[b_type])
                             
-                            # Determine label formatting based on duration to fit in the block
                             duration_mins = DURATIONS[b_type]
                             start_str = start_dt.strftime('%H:%M')
                             end_str = end_dt.strftime('%H:%M')
                             
-                            # Add <b> tags for bold times
                             if duration_mins <= 20: 
                                 bar_text = f"<b>{start_str}<br>{end_str}</b>"
                             else:
                                 bar_text = f"<b>{start_str}-{end_str}</b>"
                                 
                             schedule.append(dict(
-                                Task=f"<b>{mod}</b>", # Add <b> tags for bold names
+                                Task=f"<b>{mod}</b>", 
                                 Resource=b_type, 
                                 Start=start_dt, 
                                 Finish=end_dt,
@@ -226,7 +224,6 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
             # ==========================================
             st.success(f"✅ Schedule Generated! Peak concurrent breaks held at: **{int(pulp.value(max_concurrent))}**")
 
-            # Custom styled title block matching the image with Montserrat font
             st.markdown(
                 f"<div style='background-color: #1c2838; color: white; padding: 12px; border-radius: 4px; "
                 f"text-align: center; font-size: 22px; font-weight: bold; font-family: Montserrat, sans-serif;'>"
@@ -242,7 +239,6 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
                 text="Bar_Text", color_discrete_map=color_map
             )
             
-            # Put text directly inside the bars and force it to remain horizontal
             fig.update_traces(
                 textposition='inside', 
                 insidetextanchor='middle',
@@ -256,11 +252,12 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
                 font=dict(family='Montserrat, sans-serif', color='black', size=12),
                 xaxis=dict(
                     showgrid=True, gridcolor='#e5e5e5', 
-                    tickformat='%H:%M', dtick=3600000, # 1 hour major tick lines
+                    tickformat='%H:%M', dtick=3600000, 
                     title="<b>Time</b>", side='bottom'
                 ),
                 yaxis=dict(
-                    showgrid=True, gridcolor='#f3f4f6', title=""
+                    showgrid=True, gridcolor='#f3f4f6', title="",
+                    tickfont=dict(color='#1c2838', size=12, family='Montserrat, sans-serif')
                 ),
                 legend=dict(
                     orientation="h",
