@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import pulp
 from datetime import datetime, timedelta
 
@@ -205,7 +206,7 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
                 
             prob += max_concurrent
 
-            # Increased timeLimit to 60s and added a 5% relative gap tolerance to prevent timeout crashes
+            # Increased timeLimit to 60s and added a 5% relative gap tolerance
             solver = pulp.PULP_CBC_CMD(timeLimit=60, msg=False, gapRel=0.05)
             status = prob.solve(solver)
 
@@ -248,6 +249,18 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
 
             sched_df = pd.DataFrame(schedule)
             sched_df = sched_df.sort_values(by=['Task', 'Start'], ascending=[False, True])
+            
+            # Calculate Concurrency Over Time
+            timeline_dts = [shift_start_dt + timedelta(minutes=t) for t in time_intervals]
+            concurrency_counts = []
+            for t_dt in timeline_dts:
+                count = sum(1 for b in schedule if b['Start'] <= t_dt < b['Finish'])
+                concurrency_counts.append(count)
+                
+            concurrency_df = pd.DataFrame({
+                'Time': timeline_dts,
+                'Concurrent Breaks': concurrency_counts
+            })
 
             # ==========================================
             # 7. DASHBOARD & VISUALIZATION
@@ -264,19 +277,20 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
 
             color_map = {'Short': '#3b82f6', 'Meal': '#f97316', 'WB20': '#22c55e', 'WB70': '#a855f7'}
             
-            fig = px.timeline(
+            # --- Gantt Chart ---
+            fig_gantt = px.timeline(
                 sched_df, x_start="Start", x_end="Finish", y="Task", color="Resource",
                 text="Bar_Text", color_discrete_map=color_map
             )
             
-            fig.update_traces(
+            fig_gantt.update_traces(
                 textposition='inside', 
                 insidetextanchor='middle',
                 textangle=0,
                 textfont=dict(family='Montserrat, sans-serif', color='white', size=10)
             )
 
-            fig.update_layout(
+            fig_gantt.update_layout(
                 plot_bgcolor='white',
                 paper_bgcolor='white',
                 font=dict(family='Montserrat, sans-serif', color='black', size=12),
@@ -301,7 +315,43 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
                 height=800
             )
             
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig_gantt, use_container_width=True)
+            
+            # --- Concurrency Line Chart ---
+            st.markdown(
+                f"<div style='background-color: #1c2838; color: white; padding: 8px; border-radius: 4px; "
+                f"text-align: center; font-size: 18px; font-weight: bold; font-family: Montserrat, sans-serif;'>"
+                f"Concurrent Breaks Over Time</div>", 
+                unsafe_allow_html=True
+            )
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            fig_concurrency = px.area(
+                concurrency_df, x='Time', y='Concurrent Breaks',
+                color_discrete_sequence=['#3b82f6']
+            )
+            
+            fig_concurrency.update_traces(line_shape='hv', fill='tozeroy', alpha=0.3) # 'hv' creates step-lines typical for schedules
+            
+            fig_concurrency.update_layout(
+                plot_bgcolor='white',
+                paper_bgcolor='white',
+                font=dict(family='Montserrat, sans-serif', color='black', size=12),
+                xaxis=dict(
+                    showgrid=True, gridcolor='#e5e5e5', 
+                    tickformat='%H:%M', dtick=3600000, 
+                    title="<b>Time</b>"
+                ),
+                yaxis=dict(
+                    showgrid=True, gridcolor='#f3f4f6', title="<b>Staff on Break</b>",
+                    tickfont=dict(color='#1c2838', size=12, family='Montserrat, sans-serif'),
+                    dtick=1
+                ),
+                margin=dict(l=0, r=0, t=20, b=40),
+                height=300
+            )
+            
+            st.plotly_chart(fig_concurrency, use_container_width=True)
 
         except Exception as e:
             st.error(f"An unexpected error occurred during scheduling calculation: {str(e)}")
