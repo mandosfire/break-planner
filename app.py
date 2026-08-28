@@ -216,6 +216,10 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
                                 Bar_Text=bar_text
                             ))
 
+            if not schedule:
+                st.error("❌ Conflicting Rules! The math is physically impossible with these exact gap/time constraints. Try widening the Meal Window or increasing the Maximum Inside Time.")
+                st.stop()
+
             sched_df = pd.DataFrame(schedule)
             sched_df = sched_df.sort_values(by=['Task', 'Start'], ascending=[False, True])
 
