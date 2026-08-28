@@ -331,7 +331,7 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
                 color_discrete_sequence=['#3b82f6']
             )
             
-            fig_concurrency.update_traces(line_shape='hv', fill='tozeroy', alpha=0.3) # 'hv' creates step-lines typical for schedules
+            fig_concurrency.update_traces(line_shape='hv', fill='tozeroy', opacity=0.3) # 'hv' creates step-lines typical for schedules
             
             fig_concurrency.update_layout(
                 plot_bgcolor='white',
