@@ -290,6 +290,10 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
                 textfont=dict(family='Montserrat, sans-serif', color='white', size=10)
             )
 
+            # Calculate dynamic height: 45 pixels per row + 150 pixels for padding/legend
+            num_moderators = len(sched_df['Task'].unique())
+            dynamic_height = max(600, num_moderators * 45 + 150)
+
             fig_gantt.update_layout(
                 plot_bgcolor='white',
                 paper_bgcolor='white',
@@ -312,7 +316,7 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
                     title=""
                 ),
                 margin=dict(l=0, r=0, t=60, b=40),
-                height=800
+                height=dynamic_height
             )
             
             st.plotly_chart(fig_gantt, use_container_width=True)
@@ -331,7 +335,7 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
                 color_discrete_sequence=['#3b82f6']
             )
             
-            fig_concurrency.update_traces(line_shape='hv', fill='tozeroy', opacity=0.3) # 'hv' creates step-lines typical for schedules
+            fig_concurrency.update_traces(line_shape='hv', fill='tozeroy', opacity=0.3)
             
             fig_concurrency.update_layout(
                 plot_bgcolor='white',
