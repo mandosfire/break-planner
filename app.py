@@ -283,11 +283,13 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
                 text="Bar_Text", color_discrete_map=color_map
             )
             
+            # Sharpen text and give bars crisp, distinct borders
             fig_gantt.update_traces(
                 textposition='inside', 
                 insidetextanchor='middle',
                 textangle=0,
-                textfont=dict(family='Montserrat, sans-serif', color='white', size=10)
+                textfont=dict(family='Montserrat, sans-serif', color='white', size=11),
+                marker=dict(line=dict(width=1, color='rgba(255, 255, 255, 0.6)'))
             )
 
             # Calculate dynamic height: 45 pixels per row + 150 pixels for padding/legend
@@ -319,7 +321,32 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
                 height=dynamic_height
             )
             
-            st.plotly_chart(fig_gantt, use_container_width=True)
+            # Configure high-resolution image downloads (3x upscale = crystal-clear PNG)
+            plotly_config = {
+                'toImageButtonOptions': {
+                    'format': 'png',
+                    'filename': f'Break_Timetable_{shift_start_str}_{shift_end_str}',
+                    'height': dynamic_height,
+                    'width': 1800,       
+                    'scale': 3           
+                },
+                'displayModeBar': True
+            }
+
+            st.plotly_chart(fig_gantt, use_container_width=True, config=plotly_config)
+
+            # Direct High-Res PNG Download Button
+            try:
+                img_bytes = fig_gantt.to_image(format="png", width=1800, height=dynamic_height, scale=3)
+                st.download_button(
+                    label="📥 Download High-Resolution Timetable (PNG)",
+                    data=img_bytes,
+                    file_name=f"Timetable_{shift_start_str}_{shift_end_str}.png",
+                    mime="image/png"
+                )
+            except Exception:
+                st.info("💡 To enable the 1-click download button, ensure `kaleido` is added to your requirements.txt")
+
             
             # --- Concurrency Line Chart ---
             st.markdown(
