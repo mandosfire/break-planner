@@ -16,14 +16,14 @@ st.markdown("Maximize on-duty staff while strictly enforcing meal windows, shift
 # ==========================================
 st.sidebar.header("Global Shift Rules")
 
-shift_start_str = st.sidebar.text_input("Shift Start", value="23:30")
-shift_end_str = st.sidebar.text_input("Shift End", value="08:00")
-earliest_break_str = st.sidebar.text_input("Earliest Break Allowed", value="00:30")
-final_break_str = st.sidebar.text_input("Final Break Must End By", value="07:15")
+shift_start_str = st.sidebar.text_input("Shift Start", value="07:30")
+shift_end_str = st.sidebar.text_input("Shift End", value="16:30")
+earliest_break_str = st.sidebar.text_input("Earliest Break Allowed", value="08:30")
+final_break_str = st.sidebar.text_input("Final Break Must End By", value="15:45")
 
 st.sidebar.markdown("---")
-meal_start_str = st.sidebar.text_input("Meal Window Start", value="02:30")
-meal_end_str = st.sidebar.text_input("Meal Window End", value="05:30")
+meal_start_str = st.sidebar.text_input("Meal Window Start", value="11:30")
+meal_end_str = st.sidebar.text_input("Meal Window End", value="14:30")
 
 st.sidebar.markdown("---")
 min_gap = st.sidebar.number_input("Minimum Inside Time (mins)", value=45)
@@ -42,14 +42,12 @@ DURATIONS = {'Short': dur_short, 'Meal': dur_meal, 'WB20': dur_wb20, 'WB70': dur
 # 3. HELPER FUNCTIONS (TIME & SEQUENCING)
 # ==========================================
 def parse_time(time_str, base_date=datetime(2026, 1, 1)):
+    """Convert string to datetime without automatic overnight assumptions."""
     if not time_str or pd.isna(time_str) or str(time_str).strip() == "":
         return None
     try:
         h, m = map(int, str(time_str).strip().split(':'))
-        dt = base_date.replace(hour=h, minute=m, second=0)
-        if h < 12:
-            dt += timedelta(days=1)
-        return dt
+        return base_date.replace(hour=h, minute=m, second=0)
     except Exception:
         return None
 
@@ -97,13 +95,40 @@ edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True)
 if st.button("🚀 Generate Optimized Schedule", type="primary"):
     with st.spinner("Calculating optimal break layout..."):
         try:
-            base_dt = datetime(2026, 1, 1, 23, 30)
+            base_dt = datetime(2026, 1, 1)
             shift_start_dt = parse_time(shift_start_str, base_dt)
             shift_end_dt = parse_time(shift_end_str, base_dt)
-            earliest_dt = parse_time(earliest_break_str, base_dt)
-            final_dt = parse_time(final_break_str, base_dt)
-            meal_win_start = parse_time(meal_start_str, base_dt)
-            meal_win_end = parse_time(meal_end_str, base_dt)
+            
+            # Dynamically detect if shift crosses midnight
+            crosses_midnight = False
+            if shift_end_dt <= shift_start_dt:
+                shift_end_dt += timedelta(days=1)
+                crosses_midnight = True
+
+            def adjust_dt(dt):
+                """Pushes times to the next day only if they fall after midnight relative to the shift start."""
+                if dt is None: return None
+                if crosses_midnight and dt.time() < shift_start_dt.time():
+                    return dt + timedelta(days=1)
+                return dt
+
+            earliest_dt = adjust_dt(parse_time(earliest_break_str, base_dt))
+            final_dt = adjust_dt(parse_time(final_break_str, base_dt))
+            meal_win_start = adjust_dt(parse_time(meal_start_str, base_dt))
+            meal_win_end = adjust_dt(parse_time(meal_end_str, base_dt))
+
+            # Proactive Error Checks
+            if earliest_dt:
+                earliest_mins = int((earliest_dt - shift_start_dt).total_seconds() / 60)
+                if earliest_mins > max_gap:
+                    st.error(f"❌ Logical Conflict: 'Earliest Break' is {earliest_mins} mins into the shift, but 'Max Inside Time' is only {max_gap} mins. Increase Max Gap or lower Earliest Break.")
+                    st.stop()
+                    
+            if final_dt:
+                final_mins_from_end = int((shift_end_dt - final_dt).total_seconds() / 60)
+                if final_mins_from_end > max_gap:
+                    st.error(f"❌ Logical Conflict: 'Final Break' is {final_mins_from_end} mins before shift end, but 'Max Inside Time' is only {max_gap} mins. Increase Max Gap or raise Final Break.")
+                    st.stop()
 
             total_shift_mins = int((shift_end_dt - shift_start_dt).total_seconds() / 60)
             time_intervals = list(range(0, total_shift_mins + 1, 5))
@@ -131,7 +156,7 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
 
             for mod in seqs:
                 row = edited_df[edited_df['Name'] == mod].iloc[0]
-                fixed_wb70_dt = parse_time(row['Fixed WB70 Start'], base_dt)
+                fixed_wb70_dt = adjust_dt(parse_time(row['Fixed WB70 Start'], base_dt))
                 
                 for b_idx, b_type in enumerate(seqs[mod]):
                     dur = DURATIONS[b_type]
@@ -180,12 +205,13 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
                 
             prob += max_concurrent
 
-            solver = pulp.PULP_CBC_CMD(timeLimit=30, msg=False)
+            # Increased timeLimit to 60s and added a 5% relative gap tolerance to prevent timeout crashes
+            solver = pulp.PULP_CBC_CMD(timeLimit=60, msg=False, gapRel=0.05)
             status = prob.solve(solver)
 
             if pulp.LpStatus[status] not in ['Optimal', 'Not Solved']: 
                 if prob.objective.value() is None:
-                    st.error("❌ Conflicting Rules! The math is physically impossible with these gap/time constraints. Try widening the Meal Window or Max Gap.")
+                    st.error("❌ Conflicting Rules! The math is physically impossible with these exact gap/time constraints. Try widening the Meal Window or increasing the Maximum Inside Time.")
                     st.stop()
 
             # ==========================================
