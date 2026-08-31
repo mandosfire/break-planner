@@ -1,16 +1,24 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
-import pulp
+import numpy as np
+import scipy.sparse as sp
+from scipy.optimize import milp, LinearConstraint, Bounds
 from datetime import datetime, timedelta
+from itertools import permutations
+import random
+import math
+import hashlib
 
 # ==========================================
 # 1. PAGE CONFIGURATION & UI SETUP
 # ==========================================
 st.set_page_config(page_title="Lark Break Planner", layout="wide")
 st.title("Shift Break Optimizer")
-st.markdown("Maximize on-duty staff while strictly enforcing meal windows, shift limits, and gap times.")
+st.markdown(
+    "Maximize on-duty staff while strictly enforcing meal windows, shift limits, "
+    "inside-time rules, fixed WB70 times, and moderator break entitlements."
+)
 
 # ==========================================
 # 2. SIDEBAR RULES & CONFIGURATION
@@ -27,35 +35,43 @@ meal_start_str = st.sidebar.text_input("Meal Window Start", value="11:30")
 meal_end_str = st.sidebar.text_input("Meal Window End", value="14:30")
 
 st.sidebar.markdown("---")
-min_gap = st.sidebar.number_input("Minimum Inside Time (mins)", value=45)
-max_gap = st.sidebar.number_input("Maximum Inside Time (mins)", value=105)
+min_gap = int(st.sidebar.number_input("Minimum Inside Time (mins)", value=45, step=5))
+max_gap = int(st.sidebar.number_input("Maximum Inside Time (mins)", value=105, step=5))
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Break Durations (mins)")
-dur_short = st.sidebar.number_input("Short Break", value=15)
-dur_meal = st.sidebar.number_input("Meal Break", value=30)
-dur_wb20 = st.sidebar.number_input("WB20 Break", value=20)
-dur_wb70 = st.sidebar.number_input("WB70 Break", value=70)
+dur_short = int(st.sidebar.number_input("Short Break", value=15, step=5))
+dur_meal = int(st.sidebar.number_input("Meal Break", value=30, step=5))
+dur_wb20 = int(st.sidebar.number_input("WB20 Break", value=20, step=5))
+dur_wb70 = int(st.sidebar.number_input("WB70 Break", value=70, step=5))
 
-DURATIONS = {'Short': dur_short, 'Meal': dur_meal, 'WB20': dur_wb20, 'WB70': dur_wb70}
-BREAK_TYPES = ['Short', 'Meal', 'WB20', 'WB70']
+DURATIONS = {
+    "Short": dur_short,
+    "Meal": dur_meal,
+    "WB20": dur_wb20,
+    "WB70": dur_wb70,
+}
+BREAK_TYPES = ["Short", "Meal", "WB20", "WB70"]
+TIME_STEP = 5
+MAX_PATTERNS_PER_PROFILE = 300
+SOLVER_TIME_LIMIT = 60
+MIP_REL_GAP = 0.05
 
 # ==========================================
-# 3. HELPER FUNCTIONS (TIME & VALIDATION)
+# 3. HELPER FUNCTIONS
 # ==========================================
 def parse_time(time_str, base_date=datetime(2026, 1, 1)):
-    """Convert string to datetime without automatic overnight assumptions."""
-    if not time_str or pd.isna(time_str) or str(time_str).strip() == "":
+    """Convert HH:MM to datetime without automatic overnight assumptions."""
+    if time_str is None or pd.isna(time_str) or str(time_str).strip() == "":
         return None
     try:
-        h, m = map(int, str(time_str).strip().split(':'))
-        return base_date.replace(hour=h, minute=m, second=0)
+        h, m = map(int, str(time_str).strip().split(":"))
+        return base_date.replace(hour=h, minute=m, second=0, microsecond=0)
     except Exception:
         return None
 
 
 def safe_nonnegative_int(value):
-    """Convert editable-table values to a non-negative integer."""
     if pd.isna(value) or value == "":
         return 0
     try:
@@ -64,11 +80,394 @@ def safe_nonnegative_int(value):
         return 0
 
 
+def ceil_step(value, step=TIME_STEP):
+    return int(math.ceil(value / step) * step)
+
+
+def floor_step(value, step=TIME_STEP):
+    return int(math.floor(value / step) * step)
+
+
+def unique_break_orders(counts):
+    """Return arbitrary unique type orders for the entitlement multiset."""
+    items = []
+    for b_type in BREAK_TYPES:
+        items.extend([b_type] * counts.get(b_type, 0))
+
+    # Normal planner use is 4-6 breaks. For unusually large counts, sample orders
+    # instead of materializing an enormous permutation set.
+    if len(items) <= 8:
+        return list(set(permutations(items)))
+
+    rng = random.Random(81731)
+    seen = set()
+    base = list(items)
+    for _ in range(800):
+        rng.shuffle(base)
+        seen.add(tuple(base))
+    return list(seen)
+
+
+def profile_seed(profile_key):
+    raw = repr(profile_key).encode("utf-8")
+    return int(hashlib.sha256(raw).hexdigest()[:12], 16)
+
+
+def build_candidate_patterns(
+    counts,
+    durations,
+    total_shift_mins,
+    earliest_mins,
+    final_mins,
+    meal_start_mins,
+    meal_end_mins,
+    min_inside,
+    max_inside,
+    fixed_wb70_mins,
+    max_patterns=MAX_PATTERNS_PER_PROFILE,
+):
+    """
+    Generate complete individually-feasible schedules first.
+
+    Each candidate already satisfies:
+      - exact entitlements
+      - arbitrary break-type order
+      - earliest/final break limits
+      - min/max inside time before, between and after breaks
+      - normal Meal Window unless WB70 exists
+      - exact Fixed WB70 start when provided
+      - 5-minute break-start grid
+
+    The global optimizer then only chooses WHICH valid candidate each moderator uses.
+    This avoids the huge moderator x position x type x time binary formulation.
+    """
+    total_breaks = sum(counts.values())
+    if total_breaks <= 0:
+        return []
+
+    orders = unique_break_orders(counts)
+    if not orders:
+        return []
+
+    meal_exception = counts.get("WB70", 0) > 0
+
+    profile_key = (
+        tuple((b, counts.get(b, 0)) for b in BREAK_TYPES),
+        tuple((b, durations[b]) for b in BREAK_TYPES),
+        total_shift_mins,
+        earliest_mins,
+        final_mins,
+        meal_start_mins,
+        meal_end_mins,
+        min_inside,
+        max_inside,
+        fixed_wb70_mins,
+    )
+    rng = random.Random(profile_seed(profile_key))
+    rng.shuffle(orders)
+
+    patterns = {}
+    max_passes = 14
+    pass_no = 0
+
+    # Give each order several opportunities so the candidate pool is not biased
+    # toward one specific break-type sequence.
+    while len(patterns) < max_patterns and pass_no < max_passes:
+        pass_no += 1
+        rng.shuffle(orders)
+        per_order_target = max(2, math.ceil(max_patterns / max(1, len(orders))))
+
+        for order in orders:
+            if len(patterns) >= max_patterns:
+                break
+
+            collected_before = len(patterns)
+
+            def recurse(position, starts):
+                if len(patterns) >= max_patterns:
+                    return
+                if len(patterns) - collected_before >= per_order_target:
+                    return
+
+                b_type = order[position]
+                dur = durations[b_type]
+
+                if position == 0:
+                    low = max(earliest_mins, min_inside)
+                    high = max_inside
+                else:
+                    prev_type = order[position - 1]
+                    prev_end = starts[-1] + durations[prev_type]
+                    low = prev_end + min_inside
+                    high = prev_end + max_inside
+
+                low = ceil_step(low)
+                high = floor_step(min(high, final_mins - dur, total_shift_mins - dur))
+
+                # Minimum room needed after the current break for all remaining
+                # breaks plus the final inside-time segment.
+                remaining_types = order[position + 1 :]
+                minimum_after = (
+                    sum(durations[x] for x in remaining_types)
+                    + min_inside * (len(remaining_types) + 1)
+                )
+                high = min(high, floor_step(total_shift_mins - dur - minimum_after))
+
+                if high < low:
+                    return
+
+                if b_type == "WB70" and fixed_wb70_mins is not None:
+                    if (
+                        fixed_wb70_mins < low
+                        or fixed_wb70_mins > high
+                        or fixed_wb70_mins % TIME_STEP != 0
+                    ):
+                        candidate_starts = []
+                    else:
+                        candidate_starts = [fixed_wb70_mins]
+                else:
+                    candidate_starts = list(range(low, high + 1, TIME_STEP))
+                    rng.shuffle(candidate_starts)
+
+                for start in candidate_starts:
+                    if b_type == "Meal" and not meal_exception:
+                        if start < meal_start_mins or start + dur > meal_end_mins:
+                            continue
+
+                    if position == len(order) - 1:
+                        end = start + dur
+                        final_inside = total_shift_mins - end
+                        if end > final_mins:
+                            continue
+                        if not (min_inside <= final_inside <= max_inside):
+                            continue
+
+                        full_starts = tuple(starts + [start])
+                        key = tuple(zip(order, full_starts))
+                        patterns[key] = {
+                            "Order": tuple(order),
+                            "Starts": full_starts,
+                        }
+                    else:
+                        recurse(position + 1, starts + [start])
+
+                    if len(patterns) >= max_patterns:
+                        return
+                    if len(patterns) - collected_before >= per_order_target:
+                        return
+
+            recurse(0, [])
+
+    return list(patterns.values())
+
+
+def pattern_vectors(pattern, durations, timeline_mins):
+    """Return total-break and WB70-only active vectors for one candidate pattern."""
+    active = np.zeros(len(timeline_mins), dtype=float)
+    active_wb70 = np.zeros(len(timeline_mins), dtype=float)
+
+    for b_type, start in zip(pattern["Order"], pattern["Starts"]):
+        finish = start + durations[b_type]
+        mask = np.array([(start <= t < finish) for t in timeline_mins], dtype=float)
+        active += mask
+        if b_type == "WB70":
+            active_wb70 += mask
+
+    return active, active_wb70
+
+
+def greedy_fallback(moderators, pattern_sets, vector_sets, timeline_len):
+    """Always produce a complete feasible selection if individual candidates exist."""
+    overall = np.zeros(timeline_len, dtype=float)
+    wb70 = np.zeros(timeline_len, dtype=float)
+    chosen = {}
+
+    # Place WB70 moderators first because they are operationally more restrictive.
+    order = sorted(
+        range(len(moderators)),
+        key=lambda i: moderators[i]["Counts"].get("WB70", 0),
+        reverse=True,
+    )
+
+    for m_idx in order:
+        best_idx = None
+        best_score = None
+        active_mat, wb_mat = vector_sets[m_idx]
+
+        for p_idx in range(active_mat.shape[1]):
+            new_overall = overall + active_mat[:, p_idx]
+            new_wb = wb70 + wb_mat[:, p_idx]
+            # Same priority structure as the MILP, with a quadratic smoothing term.
+            score = (
+                3000 * np.max(new_wb)
+                + 1000 * np.max(new_overall)
+                + np.sum(new_overall * (new_overall + 1) / 2)
+            )
+            if best_score is None or score < best_score:
+                best_score = score
+                best_idx = p_idx
+
+        chosen[m_idx] = best_idx
+        overall += active_mat[:, best_idx]
+        wb70 += wb_mat[:, best_idx]
+
+    return chosen, int(np.max(overall)), int(np.max(wb70))
+
+
+def optimize_pattern_selection(moderators, pattern_sets, vector_sets, timeline_mins):
+    """
+    Set-partitioning MILP: choose exactly one complete feasible pattern per moderator.
+
+    This model is dramatically smaller than the previous break-level formulation,
+    so time limits no longer get confused with individual schedule infeasibility.
+    """
+    moderator_count = len(moderators)
+    timeline_len = len(timeline_mins)
+
+    # One binary variable for every moderator/candidate-pattern pair.
+    y_offsets = []
+    cursor = 0
+    for patterns in pattern_sets:
+        y_offsets.append(cursor)
+        cursor += len(patterns)
+    n_y = cursor
+
+    idx_max_concurrent = n_y
+    idx_max_wb70 = n_y + 1
+    idx_e = n_y + 2
+    n_e = timeline_len * moderator_count
+    n_vars = n_y + 2 + n_e
+
+    c = np.zeros(n_vars, dtype=float)
+    c[idx_max_concurrent] = 1000.0
+    c[idx_max_wb70] = 3000.0
+
+    # Triangular occupancy penalty: equivalent to 1+2+...+load at each time.
+    for t_idx in range(timeline_len):
+        for k in range(moderator_count):
+            c[idx_e + t_idx * moderator_count + k] = float(k + 1)
+
+    integrality = np.zeros(n_vars, dtype=int)
+    integrality[:n_y] = 1
+    integrality[idx_max_concurrent] = 1
+    integrality[idx_max_wb70] = 1
+
+    lower = np.zeros(n_vars, dtype=float)
+    upper = np.full(n_vars, np.inf, dtype=float)
+    upper[:n_y] = 1.0
+    upper[idx_max_concurrent] = float(moderator_count)
+    upper[idx_max_wb70] = float(moderator_count)
+    upper[idx_e:] = 1.0
+
+    rows = []
+    lbs = []
+    ubs = []
+
+    # Exactly one complete feasible candidate per moderator.
+    for m_idx, patterns in enumerate(pattern_sets):
+        row = {}
+        off = y_offsets[m_idx]
+        for p_idx in range(len(patterns)):
+            row[off + p_idx] = 1.0
+        rows.append(row)
+        lbs.append(1.0)
+        ubs.append(1.0)
+
+    # Concurrency and flattening constraints.
+    for t_idx in range(timeline_len):
+        load_terms = {}
+        wb_terms = {}
+
+        for m_idx in range(moderator_count):
+            active_mat, wb_mat = vector_sets[m_idx]
+            off = y_offsets[m_idx]
+            for p_idx in range(active_mat.shape[1]):
+                a = active_mat[t_idx, p_idx]
+                w = wb_mat[t_idx, p_idx]
+                if a:
+                    load_terms[off + p_idx] = float(a)
+                if w:
+                    wb_terms[off + p_idx] = float(w)
+
+        row = dict(load_terms)
+        row[idx_max_concurrent] = -1.0
+        rows.append(row)
+        lbs.append(-np.inf)
+        ubs.append(0.0)
+
+        row = dict(wb_terms)
+        row[idx_max_wb70] = -1.0
+        rows.append(row)
+        lbs.append(-np.inf)
+        ubs.append(0.0)
+
+        row = dict(load_terms)
+        for k in range(moderator_count):
+            row[idx_e + t_idx * moderator_count + k] = -1.0
+        rows.append(row)
+        lbs.append(0.0)
+        ubs.append(0.0)
+
+    data = []
+    row_idx = []
+    col_idx = []
+    for r, row in enumerate(rows):
+        for c_idx, value in row.items():
+            row_idx.append(r)
+            col_idx.append(c_idx)
+            data.append(value)
+
+    A = sp.csr_matrix((data, (row_idx, col_idx)), shape=(len(rows), n_vars))
+    constraints = LinearConstraint(A, np.array(lbs), np.array(ubs))
+    bounds = Bounds(lower, upper)
+
+    result = milp(
+        c,
+        integrality=integrality,
+        bounds=bounds,
+        constraints=constraints,
+        options={
+            "time_limit": SOLVER_TIME_LIMIT,
+            "mip_rel_gap": MIP_REL_GAP,
+            "disp": False,
+        },
+    )
+
+    if result.x is None:
+        chosen, peak, wb_peak = greedy_fallback(
+            moderators, pattern_sets, vector_sets, timeline_len
+        )
+        return {
+            "Chosen": chosen,
+            "Peak": peak,
+            "WB70Peak": wb_peak,
+            "UsedFallback": True,
+            "SolverMessage": result.message,
+        }
+
+    chosen = {}
+    for m_idx, patterns in enumerate(pattern_sets):
+        off = y_offsets[m_idx]
+        vals = result.x[off : off + len(patterns)]
+        chosen[m_idx] = int(np.argmax(vals))
+
+    return {
+        "Chosen": chosen,
+        "Peak": int(round(result.x[idx_max_concurrent])),
+        "WB70Peak": int(round(result.x[idx_max_wb70])),
+        "UsedFallback": not bool(result.success),
+        "SolverMessage": result.message,
+    }
+
+
 # ==========================================
 # 4. MODERATOR DATA TABLE
 # ==========================================
 st.subheader("Moderator List & Entitlements")
-st.caption("Meal Exception is automatic: any moderator with at least one WB70 may have their Meal outside the normal Meal Window.")
+st.caption(
+    "Break order is fully arbitrary. Meal Exception is automatic: if WB70s > 0, "
+    "that moderator's Meal is not restricted to the normal Meal Window."
+)
 
 default_data = [
     {"Name": "Alper Uçar", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "Fixed WB70 Start": ""},
@@ -88,31 +487,28 @@ default_data = [
     {"Name": "Zeynep Öykü Ercan", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "Fixed WB70 Start": ""},
 ]
 
-df = pd.DataFrame(default_data)
-edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True)
+edited_df = st.data_editor(pd.DataFrame(default_data), num_rows="dynamic", use_container_width=True)
 
 # ==========================================
-# 5. SOLVER ENGINE (PuLP)
+# 5. SOLVER ENGINE
 # ==========================================
 if st.button("🚀 Generate Optimized Schedule", type="primary"):
-    with st.spinner("Calculating optimal break layout..."):
+    with st.spinner("Calculating optimized break layout..."):
         try:
             base_dt = datetime(2026, 1, 1)
             shift_start_dt = parse_time(shift_start_str, base_dt)
             shift_end_dt = parse_time(shift_end_str, base_dt)
 
             if shift_start_dt is None or shift_end_dt is None:
-                st.error("❌ Invalid Shift Start or Shift End time. Use HH:MM format.")
+                st.error("❌ Invalid Shift Start or Shift End. Use HH:MM format.")
                 st.stop()
 
-            # Dynamically detect if shift crosses midnight
             crosses_midnight = False
             if shift_end_dt <= shift_start_dt:
                 shift_end_dt += timedelta(days=1)
                 crosses_midnight = True
 
             def adjust_dt(dt):
-                """Push times to the next day when they belong to the after-midnight part of an overnight shift."""
                 if dt is None:
                     return None
                 if crosses_midnight and dt.time() < shift_start_dt.time():
@@ -124,337 +520,250 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
             meal_win_start = adjust_dt(parse_time(meal_start_str, base_dt))
             meal_win_end = adjust_dt(parse_time(meal_end_str, base_dt))
 
-            if earliest_dt is None or final_dt is None:
-                st.error("❌ Invalid Earliest Break or Final Break time. Use HH:MM format.")
-                st.stop()
-
-            if meal_win_start is None or meal_win_end is None:
-                st.error("❌ Invalid Meal Window time. Use HH:MM format.")
+            if any(x is None for x in [earliest_dt, final_dt, meal_win_start, meal_win_end]):
+                st.error("❌ Invalid Earliest/Final/Meal Window time. Use HH:MM format.")
                 st.stop()
 
             if min_gap > max_gap:
-                st.error("❌ Logical Conflict: Minimum Inside Time cannot be greater than Maximum Inside Time.")
-                st.stop()
-
-            # Proactive Error Checks
-            earliest_mins = int((earliest_dt - shift_start_dt).total_seconds() / 60)
-            if earliest_mins > max_gap:
-                st.error(
-                    f"❌ Logical Conflict: 'Earliest Break' is {earliest_mins} mins into the shift, "
-                    f"but 'Max Inside Time' is only {max_gap} mins. Increase Max Gap or lower Earliest Break."
-                )
-                st.stop()
-
-            final_mins_from_end = int((shift_end_dt - final_dt).total_seconds() / 60)
-            if final_mins_from_end > max_gap:
-                st.error(
-                    f"❌ Logical Conflict: 'Final Break' is {final_mins_from_end} mins before shift end, "
-                    f"but 'Max Inside Time' is only {max_gap} mins. Increase Max Gap or raise Final Break."
-                )
+                st.error("❌ Minimum Inside Time cannot be greater than Maximum Inside Time.")
                 st.stop()
 
             total_shift_mins = int((shift_end_dt - shift_start_dt).total_seconds() / 60)
-            time_intervals = list(range(0, total_shift_mins + 1, 5))
+            earliest_mins = int((earliest_dt - shift_start_dt).total_seconds() / 60)
+            final_mins = int((final_dt - shift_start_dt).total_seconds() / 60)
+            meal_start_mins = int((meal_win_start - shift_start_dt).total_seconds() / 60)
+            meal_end_mins = int((meal_win_end - shift_start_dt).total_seconds() / 60)
 
-            prob = pulp.LpProblem("Maximize_On_Duty", pulp.LpMinimize)
+            if earliest_mins > max_gap:
+                st.error(
+                    f"❌ Logical Conflict: Earliest Break is {earliest_mins} mins into the shift, "
+                    f"but Maximum Inside Time is {max_gap} mins."
+                )
+                st.stop()
 
-            # x[(mod_id, position, break_type, t)] = 1 means:
-            # chronological break position `position` is of `break_type` and starts t minutes after shift start.
-            # This allows the SOLVER to choose the break-type order instead of using a hard-coded sequence.
-            x = {}
-            moderator_data = {}
-            position_start_expr = {}
-            position_duration_expr = {}
+            if total_shift_mins - final_mins > max_gap:
+                st.error(
+                    f"❌ Logical Conflict: Final Break limit leaves {total_shift_mins - final_mins} mins "
+                    f"before shift end, above the Maximum Inside Time of {max_gap} mins."
+                )
+                st.stop()
 
-            max_concurrent = pulp.LpVariable("Max_Concurrent", lowBound=0, cat='Integer')
-            max_wb70_concurrent = pulp.LpVariable("Max_WB70_Concurrent", lowBound=0, cat='Integer')
+            if final_mins <= earliest_mins:
+                st.error("❌ Final Break limit must occur after Earliest Break.")
+                st.stop()
 
-            # Prepare moderators and create decision variables
+            # Build moderator records and cache candidate sets by identical rule profile.
+            moderators = []
+            profile_cache = {}
+
             for row_idx, row in edited_df.iterrows():
-                name = str(row.get('Name', '')).strip()
-                if not name or name.lower() == 'nan':
+                name = str(row.get("Name", "")).strip()
+                if not name or name.lower() == "nan":
                     continue
 
                 counts = {
-                    'Short': safe_nonnegative_int(row.get('Shorts', 0)),
-                    'Meal': safe_nonnegative_int(row.get('Meals', 0)),
-                    'WB20': safe_nonnegative_int(row.get('WB20s', 0)),
-                    'WB70': safe_nonnegative_int(row.get('WB70s', 0)),
+                    "Short": safe_nonnegative_int(row.get("Shorts", 0)),
+                    "Meal": safe_nonnegative_int(row.get("Meals", 0)),
+                    "WB20": safe_nonnegative_int(row.get("WB20s", 0)),
+                    "WB70": safe_nonnegative_int(row.get("WB70s", 0)),
                 }
-                total_breaks = sum(counts.values())
-                if total_breaks == 0:
+                if sum(counts.values()) == 0:
                     continue
 
-                mod_id = f"m{row_idx}"
-                fixed_wb70_dt = adjust_dt(parse_time(row.get('Fixed WB70 Start', ''), base_dt))
-                automatic_meal_exception = counts['WB70'] > 0
-                allowed_types = [b for b in BREAK_TYPES if counts[b] > 0]
+                fixed_dt = adjust_dt(parse_time(row.get("Fixed WB70 Start", ""), base_dt))
+                fixed_mins = None
+                if fixed_dt is not None:
+                    fixed_mins = int((fixed_dt - shift_start_dt).total_seconds() / 60)
 
-                moderator_data[mod_id] = {
-                    'Name': name,
-                    'Counts': counts,
-                    'Positions': list(range(total_breaks)),
-                    'AllowedTypes': allowed_types,
-                    'FixedWB70': fixed_wb70_dt,
-                    'MealException': automatic_meal_exception,
-                }
-
-                # Candidate variables. Illegal type/time combinations are not created at all.
-                for pos in range(total_breaks):
-                    for b_type in allowed_types:
-                        dur = DURATIONS[b_type]
-                        for t in time_intervals:
-                            actual_time_dt = shift_start_dt + timedelta(minutes=t)
-                            finish_time_dt = actual_time_dt + timedelta(minutes=dur)
-
-                            # Global break bounds
-                            if actual_time_dt < earliest_dt:
-                                continue
-                            if finish_time_dt > final_dt or finish_time_dt > shift_end_dt:
-                                continue
-
-                            # Meal window, unless moderator has WB70 (automatic Meal Exception)
-                            if b_type == 'Meal' and not automatic_meal_exception:
-                                if actual_time_dt < meal_win_start or finish_time_dt > meal_win_end:
-                                    continue
-
-                            # Optional fixed WB70 start
-                            if b_type == 'WB70' and fixed_wb70_dt is not None:
-                                if actual_time_dt != fixed_wb70_dt:
-                                    continue
-
-                            x[(mod_id, pos, b_type, t)] = pulp.LpVariable(
-                                f"x_{mod_id}_{pos}_{b_type}_{t}", cat='Binary'
-                            )
-
-            if not moderator_data:
-                st.error("❌ No moderators with break entitlements were provided.")
-                st.stop()
-
-            # Every chronological position must contain exactly one break type at exactly one start time.
-            for mod_id, info in moderator_data.items():
-                for pos in info['Positions']:
-                    pos_vars = [
-                        var for (m, p, b, t), var in x.items()
-                        if m == mod_id and p == pos
-                    ]
-                    if not pos_vars:
-                        st.error(
-                            f"❌ No valid time exists for break position {pos + 1} of {info['Name']} under the current rules."
-                        )
-                        st.stop()
-                    prob += pulp.lpSum(pos_vars) == 1
-
-                # Exact entitlement counts, while allowing arbitrary break-type order.
-                for b_type in info['AllowedTypes']:
-                    type_vars = [
-                        var for (m, p, b, t), var in x.items()
-                        if m == mod_id and b == b_type
-                    ]
-                    prob += pulp.lpSum(type_vars) == info['Counts'][b_type]
-
-                # Build linear expressions for start and duration of each chronological position.
-                for pos in info['Positions']:
-                    vars_for_pos = [
-                        (b, t, var) for (m, p, b, t), var in x.items()
-                        if m == mod_id and p == pos
-                    ]
-                    position_start_expr[(mod_id, pos)] = pulp.lpSum(
-                        t * var for b, t, var in vars_for_pos
-                    )
-                    position_duration_expr[(mod_id, pos)] = pulp.lpSum(
-                        DURATIONS[b] * var for b, t, var in vars_for_pos
-                    )
-
-            # Chronological order + min/max inside-time constraints between consecutive breaks.
-            # The position order is chronological, but BREAK TYPE is completely solver-selected.
-            for mod_id, info in moderator_data.items():
-                positions = info['Positions']
-
-                for pos in positions[:-1]:
-                    current_start = position_start_expr[(mod_id, pos)]
-                    current_duration = position_duration_expr[(mod_id, pos)]
-                    next_start = position_start_expr[(mod_id, pos + 1)]
-
-                    prob += next_start >= current_start + current_duration + min_gap
-                    prob += next_start <= current_start + current_duration + max_gap
-
-                # Shift start -> first break
-                first_start = position_start_expr[(mod_id, positions[0])]
-                prob += first_start >= min_gap
-                prob += first_start <= max_gap
-
-                # Last break -> shift end
-                last_pos = positions[-1]
-                last_start = position_start_expr[(mod_id, last_pos)]
-                last_duration = position_duration_expr[(mod_id, last_pos)]
-                prob += total_shift_mins - (last_start + last_duration) >= min_gap
-                prob += total_shift_mins - (last_start + last_duration) <= max_gap
-
-            # Create flattening variables to mathematically penalize clustering.
-            # Size dynamically so the model also works when >34 moderators are entered.
-            max_possible_concurrency = max(1, len(moderator_data))
-            e_vars = {}
-            for t in time_intervals:
-                for k in range(1, max_possible_concurrency + 1):
-                    e_vars[(t, k)] = pulp.LpVariable(
-                        f"e_{t}_{k}", lowBound=0, upBound=1, cat='Continuous'
-                    )
-
-            # Concurrency calculation directly from arbitrary-type start variables.
-            for t in time_intervals:
-                active_at_t = []
-                active_wb70_at_t = []
-
-                for (mod_id, pos, b_type, ts), var in x.items():
-                    dur = DURATIONS[b_type]
-                    if t - dur < ts <= t:
-                        active_at_t.append(var)
-                        if b_type == 'WB70':
-                            active_wb70_at_t.append(var)
-
-                # 1. Track absolute peak concurrency
-                prob += pulp.lpSum(active_at_t) <= max_concurrent
-
-                # 2. Specifically track WB70 concurrency to force staggering
-                if active_wb70_at_t:
-                    prob += pulp.lpSum(active_wb70_at_t) <= max_wb70_concurrent
-
-                # 3. Connect active breaks to the flattening variables
-                prob += pulp.lpSum(active_at_t) == pulp.lpSum(
-                    e_vars[(t, k)] for k in range(1, max_possible_concurrency + 1)
-                )
-
-            # Objective:
-            # - Weight 3000: strongly prevent 70-minute blocks from overlapping
-            # - Weight 1000: minimize the overall maximum peak
-            # - Weight k: flatten all remaining overlap across the schedule
-            prob += (
-                (3000 * max_wb70_concurrent)
-                + (1000 * max_concurrent)
-                + pulp.lpSum(
-                    k * e_vars[(t, k)]
-                    for t in time_intervals
-                    for k in range(1, max_possible_concurrency + 1)
-                )
-            )
-
-            # Same CBC settings as the original optimizer
-            solver = pulp.PULP_CBC_CMD(timeLimit=60, msg=False, gapRel=0.05)
-            status = prob.solve(solver)
-            status_name = pulp.LpStatus[status]
-
-            if status_name not in ['Optimal', 'Not Solved']:
-                if prob.objective.value() is None:
+                if fixed_mins is not None and counts["WB70"] == 0:
                     st.error(
-                        "❌ Conflicting Rules! The math is physically impossible with these exact gap/time constraints. "
-                        "Try widening the Meal Window or increasing the Maximum Inside Time."
+                        f"❌ {name} has a Fixed WB70 Start but WB70s is 0. "
+                        "Either clear the fixed time or give the moderator a WB70 entitlement."
                     )
                     st.stop()
 
-            # ==========================================
-            # 6. EXTRACT & FORMAT DATA
-            # ==========================================
+                profile = (
+                    tuple((b, counts[b]) for b in BREAK_TYPES),
+                    fixed_mins,
+                )
+
+                if profile not in profile_cache:
+                    patterns = build_candidate_patterns(
+                        counts=counts,
+                        durations=DURATIONS,
+                        total_shift_mins=total_shift_mins,
+                        earliest_mins=earliest_mins,
+                        final_mins=final_mins,
+                        meal_start_mins=meal_start_mins,
+                        meal_end_mins=meal_end_mins,
+                        min_inside=min_gap,
+                        max_inside=max_gap,
+                        fixed_wb70_mins=fixed_mins,
+                    )
+                    profile_cache[profile] = patterns
+
+                patterns = profile_cache[profile]
+                if not patterns:
+                    extra = ""
+                    if fixed_mins is not None:
+                        extra = f" Fixed WB70 start: {row.get('Fixed WB70 Start', '')}."
+                    st.error(
+                        f"❌ No individually feasible break layout exists for {name} under the current rules.{extra} "
+                        "This is a genuine moderator-level rule conflict, not a solver timeout."
+                    )
+                    st.stop()
+
+                moderators.append(
+                    {
+                        "Name": name,
+                        "Counts": counts,
+                        "FixedWB70": fixed_mins,
+                        "Profile": profile,
+                    }
+                )
+
+            if not moderators:
+                st.error("❌ No moderators with break entitlements were provided.")
+                st.stop()
+
+            timeline_mins = list(range(0, total_shift_mins + 1, TIME_STEP))
+
+            # Each moderator references the cached candidate pool for their profile.
+            pattern_sets = []
+            vector_sets = []
+            vector_cache = {}
+
+            for mod in moderators:
+                patterns = profile_cache[mod["Profile"]]
+                pattern_sets.append(patterns)
+
+                if mod["Profile"] not in vector_cache:
+                    active_cols = []
+                    wb_cols = []
+                    for pattern in patterns:
+                        a, w = pattern_vectors(pattern, DURATIONS, timeline_mins)
+                        active_cols.append(a)
+                        wb_cols.append(w)
+                    vector_cache[mod["Profile"]] = (
+                        np.stack(active_cols, axis=1),
+                        np.stack(wb_cols, axis=1),
+                    )
+
+                vector_sets.append(vector_cache[mod["Profile"]])
+
+            result = optimize_pattern_selection(
+                moderators, pattern_sets, vector_sets, timeline_mins
+            )
+
             schedule = []
-            selected_positions = set()
-
-            for (mod_id, pos, b_type, t), var in x.items():
-                value = pulp.value(var)
-                if value is not None and value > 0.5:
-                    start_dt = shift_start_dt + timedelta(minutes=t)
+            for m_idx, mod in enumerate(moderators):
+                pattern = pattern_sets[m_idx][result["Chosen"][m_idx]]
+                for b_type, start_min in zip(pattern["Order"], pattern["Starts"]):
+                    start_dt = shift_start_dt + timedelta(minutes=int(start_min))
                     end_dt = start_dt + timedelta(minutes=DURATIONS[b_type])
-
                     duration_mins = DURATIONS[b_type]
-                    start_str = start_dt.strftime('%H:%M')
-                    end_str = end_dt.strftime('%H:%M')
+                    start_str = start_dt.strftime("%H:%M")
+                    end_str = end_dt.strftime("%H:%M")
 
                     if duration_mins <= 20:
                         bar_text = f"<b>{start_str}<br>{end_str}</b>"
                     else:
                         bar_text = f"<b>{start_str}-{end_str}</b>"
 
-                    schedule.append(dict(
-                        Task=f"<b>{moderator_data[mod_id]['Name']}</b>",
-                        Resource=b_type,
-                        Start=start_dt,
-                        Finish=end_dt,
-                        Bar_Text=bar_text,
-                        _ModID=mod_id,
-                        _Position=pos,
-                    ))
-                    selected_positions.add((mod_id, pos))
+                    schedule.append(
+                        {
+                            "Task": f"<b>{mod['Name']}</b>",
+                            "Resource": b_type,
+                            "Start": start_dt,
+                            "Finish": end_dt,
+                            "Bar_Text": bar_text,
+                        }
+                    )
 
-            expected_positions = sum(len(info['Positions']) for info in moderator_data.values())
-            if not schedule or len(selected_positions) != expected_positions:
-                st.error(
-                    "❌ No complete feasible schedule was found within the solver run. "
-                    "Try widening the Meal Window, increasing the Maximum Inside Time, or reducing conflicting fixed WB70 times."
-                )
+            if not schedule:
+                st.error("❌ No schedule could be constructed.")
                 st.stop()
 
-            sched_df = pd.DataFrame(schedule)
-            sched_df = sched_df.sort_values(by=['Task', 'Start'], ascending=[False, True])
-
-            # Calculate Concurrency Over Time
-            timeline_dts = [shift_start_dt + timedelta(minutes=t) for t in time_intervals]
-            concurrency_counts = []
-            for t_dt in timeline_dts:
-                count = sum(1 for b in schedule if b['Start'] <= t_dt < b['Finish'])
-                concurrency_counts.append(count)
-
-            concurrency_df = pd.DataFrame({
-                'Time': timeline_dts,
-                'Concurrent Breaks': concurrency_counts
-            })
-
-            # ==========================================
-            # 7. DASHBOARD & VISUALIZATION
-            # ==========================================
-            st.success(
-                f"✅ Schedule Generated! Peak concurrent breaks held at: **{int(round(pulp.value(max_concurrent)))}**"
+            sched_df = pd.DataFrame(schedule).sort_values(
+                by=["Task", "Start"], ascending=[False, True]
             )
 
+            timeline_dts = [shift_start_dt + timedelta(minutes=t) for t in timeline_mins]
+            concurrency_counts = [
+                sum(1 for b in schedule if b["Start"] <= t_dt < b["Finish"])
+                for t_dt in timeline_dts
+            ]
+            concurrency_df = pd.DataFrame(
+                {"Time": timeline_dts, "Concurrent Breaks": concurrency_counts}
+            )
+
+            if result["UsedFallback"]:
+                st.warning(
+                    "⚠️ The mathematical optimizer reached its time/optimality limit, so the app used its "
+                    "complete feasible fallback selection rather than incorrectly reporting the schedule as impossible."
+                )
+
+            st.success(
+                f"✅ Schedule Generated! Peak concurrent breaks: **{result['Peak']}**  |  "
+                f"Peak concurrent WB70s: **{result['WB70Peak']}**"
+            )
+
+            # ==========================================
+            # 6. DASHBOARD & VISUALIZATION
+            # ==========================================
             st.markdown(
                 f"<div style='background-color: #1c2838; color: white; padding: 12px; border-radius: 4px; "
                 f"text-align: center; font-size: 22px; font-weight: bold; font-family: Montserrat, sans-serif;'>"
                 f"Shift Break Timetable &bull; {shift_start_str}-{shift_end_str}</div>",
-                unsafe_allow_html=True
+                unsafe_allow_html=True,
             )
             st.markdown("<br>", unsafe_allow_html=True)
 
-            color_map = {'Short': '#3b82f6', 'Meal': '#f97316', 'WB20': '#22c55e', 'WB70': '#a855f7'}
+            color_map = {
+                "Short": "#3b82f6",
+                "Meal": "#f97316",
+                "WB20": "#22c55e",
+                "WB70": "#a855f7",
+            }
 
-            # --- Gantt Chart ---
             fig_gantt = px.timeline(
-                sched_df, x_start="Start", x_end="Finish", y="Task", color="Resource",
-                text="Bar_Text", color_discrete_map=color_map
+                sched_df,
+                x_start="Start",
+                x_end="Finish",
+                y="Task",
+                color="Resource",
+                text="Bar_Text",
+                color_discrete_map=color_map,
             )
 
-            # Sharpen text and give bars crisp, distinct borders
             fig_gantt.update_traces(
-                textposition='inside',
-                insidetextanchor='middle',
+                textposition="inside",
+                insidetextanchor="middle",
                 textangle=0,
-                textfont=dict(family='Montserrat, sans-serif', color='white', size=11),
-                marker=dict(line=dict(width=1, color='rgba(255, 255, 255, 0.6)'))
+                textfont=dict(family="Montserrat, sans-serif", color="white", size=11),
+                marker=dict(line=dict(width=1, color="rgba(255, 255, 255, 0.6)")),
             )
 
-            # Calculate dynamic height: 45 pixels per row + 150 pixels for padding/legend
-            num_moderators = len(sched_df['Task'].unique())
+            num_moderators = len(sched_df["Task"].unique())
             dynamic_height = max(600, num_moderators * 45 + 150)
 
             fig_gantt.update_layout(
-                plot_bgcolor='white',
-                paper_bgcolor='white',
-                font=dict(family='Montserrat, sans-serif', color='black', size=12),
+                plot_bgcolor="white",
+                paper_bgcolor="white",
+                font=dict(family="Montserrat, sans-serif", color="black", size=12),
                 xaxis=dict(
-                    showgrid=True, gridcolor='#e5e5e5',
-                    tickformat='%H:%M', dtick=3600000,
-                    title="<b>Time</b>", side='bottom'
+                    showgrid=True,
+                    gridcolor="#e5e5e5",
+                    tickformat="%H:%M",
+                    dtick=3600000,
+                    title="<b>Time</b>",
+                    side="bottom",
                 ),
                 yaxis=dict(
-                    showgrid=True, gridcolor='#f3f4f6', title="",
-                    tickfont=dict(color='#1c2838', size=12, family='Montserrat, sans-serif')
+                    showgrid=True,
+                    gridcolor="#f3f4f6",
+                    title="",
+                    tickfont=dict(color="#1c2838", size=12, family="Montserrat, sans-serif"),
                 ),
                 legend=dict(
                     orientation="h",
@@ -462,73 +771,78 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
                     y=1.02,
                     xanchor="center",
                     x=0.5,
-                    title=""
+                    title="",
                 ),
                 margin=dict(l=0, r=0, t=60, b=40),
-                height=dynamic_height
+                height=dynamic_height,
             )
 
-            # Configure high-resolution image downloads (3x upscale = crystal-clear PNG)
             plotly_config = {
-                'toImageButtonOptions': {
-                    'format': 'png',
-                    'filename': f'Break_Timetable_{shift_start_str}_{shift_end_str}',
-                    'height': dynamic_height,
-                    'width': 1800,
-                    'scale': 3
+                "toImageButtonOptions": {
+                    "format": "png",
+                    "filename": f"Break_Timetable_{shift_start_str}_{shift_end_str}",
+                    "height": dynamic_height,
+                    "width": 1800,
+                    "scale": 3,
                 },
-                'displayModeBar': True
+                "displayModeBar": True,
             }
 
             st.plotly_chart(fig_gantt, use_container_width=True, config=plotly_config)
 
-            # Direct High-Res PNG Download Button
             try:
-                img_bytes = fig_gantt.to_image(format="png", width=1800, height=dynamic_height, scale=3)
+                img_bytes = fig_gantt.to_image(
+                    format="png", width=1800, height=dynamic_height, scale=3
+                )
                 st.download_button(
                     label="📥 Download High-Resolution Timetable (PNG)",
                     data=img_bytes,
                     file_name=f"Timetable_{shift_start_str}_{shift_end_str}.png",
-                    mime="image/png"
+                    mime="image/png",
                 )
             except Exception:
-                st.info("💡 To enable the 1-click download button, ensure `kaleido` is added to your requirements.txt")
+                st.info(
+                    "💡 To enable the 1-click PNG button, ensure kaleido is installed. "
+                    "The Plotly toolbar export still remains available."
+                )
 
-            # --- Concurrency Line Chart ---
             st.markdown(
-                f"<div style='background-color: #1c2838; color: white; padding: 8px; border-radius: 4px; "
-                f"text-align: center; font-size: 18px; font-weight: bold; font-family: Montserrat, sans-serif;'>"
-                f"Concurrent Breaks Over Time</div>",
-                unsafe_allow_html=True
+                "<div style='background-color: #1c2838; color: white; padding: 8px; border-radius: 4px; "
+                "text-align: center; font-size: 18px; font-weight: bold; font-family: Montserrat, sans-serif;'>"
+                "Concurrent Breaks Over Time</div>",
+                unsafe_allow_html=True,
             )
             st.markdown("<br>", unsafe_allow_html=True)
 
             fig_concurrency = px.area(
-                concurrency_df, x='Time', y='Concurrent Breaks',
-                color_discrete_sequence=['#3b82f6']
+                concurrency_df,
+                x="Time",
+                y="Concurrent Breaks",
+                color_discrete_sequence=["#3b82f6"],
             )
-
-            fig_concurrency.update_traces(line_shape='hv', fill='tozeroy', opacity=0.3)
-
+            fig_concurrency.update_traces(line_shape="hv", fill="tozeroy", opacity=0.3)
             fig_concurrency.update_layout(
-                plot_bgcolor='white',
-                paper_bgcolor='white',
-                font=dict(family='Montserrat, sans-serif', color='black', size=12),
+                plot_bgcolor="white",
+                paper_bgcolor="white",
+                font=dict(family="Montserrat, sans-serif", color="black", size=12),
                 xaxis=dict(
-                    showgrid=True, gridcolor='#e5e5e5',
-                    tickformat='%H:%M', dtick=3600000,
-                    title="<b>Time</b>"
+                    showgrid=True,
+                    gridcolor="#e5e5e5",
+                    tickformat="%H:%M",
+                    dtick=3600000,
+                    title="<b>Time</b>",
                 ),
                 yaxis=dict(
-                    showgrid=True, gridcolor='#f3f4f6', title="<b>Staff on Break</b>",
-                    tickfont=dict(color='#1c2838', size=12, family='Montserrat, sans-serif'),
-                    dtick=1
+                    showgrid=True,
+                    gridcolor="#f3f4f6",
+                    title="<b>Staff on Break</b>",
+                    tickfont=dict(color="#1c2838", size=12, family="Montserrat, sans-serif"),
+                    dtick=1,
                 ),
                 margin=dict(l=0, r=0, t=20, b=40),
-                height=300
+                height=300,
             )
-
             st.plotly_chart(fig_concurrency, use_container_width=True)
 
-        except Exception as e:
-            st.error(f"An unexpected error occurred during scheduling calculation: {str(e)}")
+        except Exception as exc:
+            st.error(f"An unexpected error occurred during scheduling calculation: {str(exc)}")
