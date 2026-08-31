@@ -194,6 +194,12 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
                     prob += total_shift_mins - (last_start + last_dur) >= min_gap
                     prob += total_shift_mins - (last_start + last_dur) <= max_gap
 
+            # Create flattening variables to mathematically penalize clustering
+            e_vars = {}
+            for t in time_intervals:
+                for k in range(1, 35): # Tracks up to 34 simultaneous breaks
+                    e_vars[(t, k)] = pulp.LpVariable(f"e_{t}_{k}", lowBound=0, upBound=1, cat='Continuous')
+
             for t in time_intervals:
                 active_at_t = []
                 for mod in seqs:
@@ -202,9 +208,15 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
                         start_window = [ts for ts in time_intervals if t - dur < ts <= t]
                         for ts in start_window:
                             active_at_t.append(starts[(mod, b_idx, ts)])
+                
+                # 1. Track the absolute peak limit
                 prob += pulp.lpSum(active_at_t) <= max_concurrent
                 
-            prob += max_concurrent
+                # 2. Connect active breaks to the flattening variables
+                prob += pulp.lpSum(active_at_t) == pulp.lpSum([e_vars[(t, k)] for k in range(1, 35)])
+                
+            # Objective: Heavily penalize the max peak (weight 1000) AND quadratically penalize all other overlap (weight k)
+            prob += 1000 * max_concurrent + pulp.lpSum([k * e_vars[(t, k)] for t in time_intervals for k in range(1, 35)])
 
             # Increased timeLimit to 60s and added a 5% relative gap tolerance
             solver = pulp.PULP_CBC_CMD(timeLimit=60, msg=False, gapRel=0.05)
