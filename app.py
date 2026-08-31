@@ -139,6 +139,7 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
             starts = {}
             seqs = {}
             max_concurrent = pulp.LpVariable("Max_Concurrent", lowBound=0, cat='Integer')
+            max_wb70_concurrent = pulp.LpVariable("Max_WB70_Concurrent", lowBound=0, cat='Integer')
 
             for idx, row in edited_df.iterrows():
                 mod = row['Name']
@@ -202,21 +203,33 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
 
             for t in time_intervals:
                 active_at_t = []
+                active_wb70_at_t = []
+                
                 for mod in seqs:
                     for b_idx, b_type in enumerate(seqs[mod]):
                         dur = DURATIONS[b_type]
                         start_window = [ts for ts in time_intervals if t - dur < ts <= t]
                         for ts in start_window:
-                            active_at_t.append(starts[(mod, b_idx, ts)])
+                            var = starts[(mod, b_idx, ts)]
+                            active_at_t.append(var)
+                            if b_type == 'WB70':
+                                active_wb70_at_t.append(var)
                 
                 # 1. Track the absolute peak limit
                 prob += pulp.lpSum(active_at_t) <= max_concurrent
                 
-                # 2. Connect active breaks to the flattening variables
+                # 2. Specifically track WB70 concurrency to force staggering
+                if active_wb70_at_t:
+                    prob += pulp.lpSum(active_wb70_at_t) <= max_wb70_concurrent
+                
+                # 3. Connect active breaks to the quadratic flattening variables
                 prob += pulp.lpSum(active_at_t) == pulp.lpSum([e_vars[(t, k)] for k in range(1, 35)])
                 
-            # Objective: Heavily penalize the max peak (weight 1000) AND quadratically penalize all other overlap (weight k)
-            prob += 1000 * max_concurrent + pulp.lpSum([k * e_vars[(t, k)] for t in time_intervals for k in range(1, 35)])
+            # Objective: 
+            # - Weight 3000: Ruthlessly prevent 70-minute blocks from overlapping
+            # - Weight 1000: Minimize the overall maximum peak
+            # - Weight k: Quadratically flatten all other overlaps in the schedule
+            prob += (3000 * max_wb70_concurrent) + (1000 * max_concurrent) + pulp.lpSum([k * e_vars[(t, k)] for t in time_intervals for k in range(1, 35)])
 
             # Increased timeLimit to 60s and added a 5% relative gap tolerance
             solver = pulp.PULP_CBC_CMD(timeLimit=60, msg=False, gapRel=0.05)
