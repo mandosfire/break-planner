@@ -17,33 +17,113 @@ st.set_page_config(page_title="Lark Break Planner", layout="wide")
 st.title("Shift Break Optimizer")
 st.markdown(
     "Maximize on-duty staff while strictly enforcing meal windows, shift limits, "
-    "inside-time rules, fixed WB70 times, and moderator break entitlements."
+    "inside-time rules, fixed WB70 times, moderator break entitlements, and queue-pressure-aware break placement."
 )
 
 # ==========================================
 # 2. SIDEBAR RULES & CONFIGURATION
 # ==========================================
-st.sidebar.header("Global Shift Rules")
+SHIFT_PRESETS = {
+    "Morning": {
+        "shift_start": "07:30",
+        "shift_end": "16:30",
+        "earliest_break": "08:30",
+        "final_break": "15:45",
+        "meal_start": "12:00",
+        "meal_end": "14:30",
+    },
+    "Mid": {
+        "shift_start": "15:00",
+        "shift_end": "00:00",
+        "earliest_break": "16:00",
+        "final_break": "23:15",
+        "meal_start": "17:00",
+        "meal_end": "21:00",
+    },
+    "Night": {
+        "shift_start": "23:30",
+        "shift_end": "08:00",
+        "earliest_break": "00:30",
+        "final_break": "07:15",
+        "meal_start": "02:00",
+        "meal_end": "05:00",
+    },
+}
 
-shift_start_str = st.sidebar.text_input("Shift Start", value="07:30")
-shift_end_str = st.sidebar.text_input("Shift End", value="16:30")
-earliest_break_str = st.sidebar.text_input("Earliest Break Allowed", value="08:30")
-final_break_str = st.sidebar.text_input("Final Break Must End By", value="15:45")
+st.sidebar.header("Shift Rules")
+shift_preset = st.sidebar.selectbox(
+    "Shift Rule Preset",
+    ["Morning", "Mid", "Night", "Custom"],
+    index=0,
+    help="Morning, Mid and Night automatically load the standard shift rules. Custom unlocks all shift-specific fields.",
+)
+
+if shift_preset == "Custom":
+    custom_defaults = SHIFT_PRESETS["Morning"]
+    shift_start_str = st.sidebar.text_input(
+        "Shift Start", value=custom_defaults["shift_start"], key="custom_shift_start"
+    )
+    shift_end_str = st.sidebar.text_input(
+        "Shift End", value=custom_defaults["shift_end"], key="custom_shift_end"
+    )
+    earliest_break_str = st.sidebar.text_input(
+        "Earliest Break Allowed", value=custom_defaults["earliest_break"], key="custom_earliest_break"
+    )
+    final_break_str = st.sidebar.text_input(
+        "Final Break Must End By", value=custom_defaults["final_break"], key="custom_final_break"
+    )
+    st.sidebar.markdown("---")
+    meal_start_str = st.sidebar.text_input(
+        "Meal Window Start", value=custom_defaults["meal_start"], key="custom_meal_start"
+    )
+    meal_end_str = st.sidebar.text_input(
+        "Meal Window End", value=custom_defaults["meal_end"], key="custom_meal_end"
+    )
+else:
+    preset_rules = SHIFT_PRESETS[shift_preset]
+    shift_start_str = st.sidebar.text_input(
+        "Shift Start", value=preset_rules["shift_start"], disabled=True, key=f"{shift_preset}_shift_start"
+    )
+    shift_end_str = st.sidebar.text_input(
+        "Shift End", value=preset_rules["shift_end"], disabled=True, key=f"{shift_preset}_shift_end"
+    )
+    earliest_break_str = st.sidebar.text_input(
+        "Earliest Break Allowed", value=preset_rules["earliest_break"], disabled=True, key=f"{shift_preset}_earliest_break"
+    )
+    final_break_str = st.sidebar.text_input(
+        "Final Break Must End By", value=preset_rules["final_break"], disabled=True, key=f"{shift_preset}_final_break"
+    )
+    st.sidebar.markdown("---")
+    meal_start_str = st.sidebar.text_input(
+        "Meal Window Start", value=preset_rules["meal_start"], disabled=True, key=f"{shift_preset}_meal_start"
+    )
+    meal_end_str = st.sidebar.text_input(
+        "Meal Window End", value=preset_rules["meal_end"], disabled=True, key=f"{shift_preset}_meal_end"
+    )
 
 st.sidebar.markdown("---")
-meal_start_str = st.sidebar.text_input("Meal Window Start", value="11:30")
-meal_end_str = st.sidebar.text_input("Meal Window End", value="14:30")
-
-st.sidebar.markdown("---")
+st.sidebar.subheader("Universal Rules")
 min_gap = int(st.sidebar.number_input("Minimum Inside Time (mins)", value=45, step=5))
 max_gap = int(st.sidebar.number_input("Maximum Inside Time (mins)", value=105, step=5))
 
-st.sidebar.markdown("---")
 st.sidebar.subheader("Break Durations (mins)")
 dur_short = int(st.sidebar.number_input("Short Break", value=15, step=5))
 dur_meal = int(st.sidebar.number_input("Meal Break", value=30, step=5))
 dur_wb20 = int(st.sidebar.number_input("WB20 Break", value=20, step=5))
 dur_wb70 = int(st.sidebar.number_input("WB70 Break", value=70, step=5))
+
+if shift_preset in ("Morning", "Mid"):
+    st.sidebar.caption(
+        "Pressure model: base volume 1836. The 15:00–16:30 Morning/Mid overlap is treated as two-shift coverage (50% relative pressure)."
+    )
+elif shift_preset == "Night":
+    st.sidebar.caption(
+        "Pressure model: uses the supplied hourly Night volume profile from 00:00–08:00."
+    )
+else:
+    st.sidebar.caption(
+        "Pressure model: Custom schedules use uniform relative pressure because no preset-specific volume/overlap profile is selected."
+    )
 
 DURATIONS = {
     "Short": dur_short,
@@ -56,6 +136,18 @@ TIME_STEP = 5
 MAX_PATTERNS_PER_PROFILE = 300
 SOLVER_TIME_LIMIT = 60
 MIP_REL_GAP = 0.05
+BASE_VOLUME = 1836.0
+OVERLAP_COVERAGE_FACTOR = 0.50
+NIGHT_VOLUME_PROFILE = {
+    0: 1836.0,
+    1: 1728.0,
+    2: 1584.0,
+    3: 1692.0,
+    4: 1656.0,
+    5: 1824.0,
+    6: 1836.0,
+    7: 1836.0,
+}
 
 # ==========================================
 # 3. HELPER FUNCTIONS
@@ -261,6 +353,70 @@ def build_candidate_patterns(
     return list(patterns.values())
 
 
+def clock_minutes(dt):
+    return dt.hour * 60 + dt.minute
+
+
+def build_pressure_profile(preset_name, shift_start_dt, timeline_mins):
+    """
+    Build a relative operational-pressure weight for every 5-minute point.
+
+    Morning/Mid:
+      - underlying volume is constant at 1836
+      - 15:00–16:30 is treated as two-shift coverage, so relative pressure = 0.50
+
+    Night:
+      - uses the user-supplied hourly volume profile
+      - relative pressure = hourly volume / 1836
+
+    Custom:
+      - neutral uniform pressure = 1.00
+    """
+    raw_volume = []
+    effective_pressure = []
+    pressure_weights = []
+    coverage_labels = []
+
+    overlap_start = 15 * 60
+    overlap_end = 16 * 60 + 30
+
+    for t in timeline_mins:
+        dt = shift_start_dt + timedelta(minutes=int(t))
+        minute_of_day = clock_minutes(dt)
+
+        volume = BASE_VOLUME
+        coverage_factor = 1.0
+        label = "Standard"
+
+        if preset_name == "Night":
+            # The breakable part of Night is 00:30 onward. 23:30–00:00 is kept
+            # at the normal 1836 baseline even though no breaks can start there.
+            if 0 <= dt.hour <= 7:
+                volume = NIGHT_VOLUME_PROFILE.get(dt.hour, BASE_VOLUME)
+            label = "Night volume profile"
+        elif preset_name in ("Morning", "Mid"):
+            if overlap_start <= minute_of_day < overlap_end:
+                coverage_factor = OVERLAP_COVERAGE_FACTOR
+                label = "Morning/Mid overlap"
+        elif preset_name == "Custom":
+            label = "Uniform custom pressure"
+
+        effective = volume * coverage_factor
+        weight = effective / BASE_VOLUME
+
+        raw_volume.append(volume)
+        effective_pressure.append(effective)
+        pressure_weights.append(weight)
+        coverage_labels.append(label)
+
+    return {
+        "RawVolume": np.array(raw_volume, dtype=float),
+        "EffectivePressure": np.array(effective_pressure, dtype=float),
+        "Weight": np.array(pressure_weights, dtype=float),
+        "Label": coverage_labels,
+    }
+
+
 def pattern_vectors(pattern, durations, timeline_mins):
     """Return total-break and WB70-only active vectors for one candidate pattern."""
     active = np.zeros(len(timeline_mins), dtype=float)
@@ -276,7 +432,7 @@ def pattern_vectors(pattern, durations, timeline_mins):
     return active, active_wb70
 
 
-def greedy_fallback(moderators, pattern_sets, vector_sets, timeline_len):
+def greedy_fallback(moderators, pattern_sets, vector_sets, timeline_len, pressure_weights):
     """Always produce a complete feasible selection if individual candidates exist."""
     overall = np.zeros(timeline_len, dtype=float)
     wb70 = np.zeros(timeline_len, dtype=float)
@@ -297,11 +453,17 @@ def greedy_fallback(moderators, pattern_sets, vector_sets, timeline_len):
         for p_idx in range(active_mat.shape[1]):
             new_overall = overall + active_mat[:, p_idx]
             new_wb = wb70 + wb_mat[:, p_idx]
-            # Same priority structure as the MILP, with a quadratic smoothing term.
+            # Pressure-aware priority structure:
+            # 1) avoid WB70 stacking
+            # 2) minimize the worst pressure-weighted staffing loss
+            # 3) keep the absolute concurrency peak sensible
+            # 4) smooth remaining breaks with greater penalties in high-pressure periods
+            weighted_load = pressure_weights * new_overall
             score = (
-                3000 * np.max(new_wb)
-                + 1000 * np.max(new_overall)
-                + np.sum(new_overall * (new_overall + 1) / 2)
+                1_000_000 * np.max(new_wb)
+                + 100_000 * np.max(weighted_load)
+                + 30_000 * np.max(new_overall)
+                + np.sum(pressure_weights * (new_overall * (new_overall + 1) / 2))
             )
             if best_score is None or score < best_score:
                 best_score = score
@@ -314,7 +476,7 @@ def greedy_fallback(moderators, pattern_sets, vector_sets, timeline_len):
     return chosen, int(np.max(overall)), int(np.max(wb70))
 
 
-def optimize_pattern_selection(moderators, pattern_sets, vector_sets, timeline_mins):
+def optimize_pattern_selection(moderators, pattern_sets, vector_sets, timeline_mins, pressure_weights):
     """
     Set-partitioning MILP: choose exactly one complete feasible pattern per moderator.
 
@@ -334,18 +496,24 @@ def optimize_pattern_selection(moderators, pattern_sets, vector_sets, timeline_m
 
     idx_max_concurrent = n_y
     idx_max_wb70 = n_y + 1
-    idx_e = n_y + 2
+    idx_max_weighted = n_y + 2
+    idx_e = n_y + 3
     n_e = timeline_len * moderator_count
-    n_vars = n_y + 2 + n_e
+    n_vars = n_y + 3 + n_e
 
     c = np.zeros(n_vars, dtype=float)
-    c[idx_max_concurrent] = 1000.0
-    c[idx_max_wb70] = 3000.0
+    # Priority hierarchy after all hard constraints:
+    #   1. WB70 peak overlap
+    #   2. worst pressure-weighted concurrent break load
+    #   3. absolute peak concurrency
+    #   4. pressure-weighted triangular smoothing
+    c[idx_max_wb70] = 1_000_000.0
+    c[idx_max_weighted] = 100_000.0
+    c[idx_max_concurrent] = 30_000.0
 
-    # Triangular occupancy penalty: equivalent to 1+2+...+load at each time.
     for t_idx in range(timeline_len):
         for k in range(moderator_count):
-            c[idx_e + t_idx * moderator_count + k] = float(k + 1)
+            c[idx_e + t_idx * moderator_count + k] = float(k + 1) * float(pressure_weights[t_idx])
 
     integrality = np.zeros(n_vars, dtype=int)
     integrality[:n_y] = 1
@@ -357,6 +525,7 @@ def optimize_pattern_selection(moderators, pattern_sets, vector_sets, timeline_m
     upper[:n_y] = 1.0
     upper[idx_max_concurrent] = float(moderator_count)
     upper[idx_max_wb70] = float(moderator_count)
+    upper[idx_max_weighted] = float(moderator_count)
     upper[idx_e:] = 1.0
 
     rows = []
@@ -391,6 +560,14 @@ def optimize_pattern_selection(moderators, pattern_sets, vector_sets, timeline_m
 
         row = dict(load_terms)
         row[idx_max_concurrent] = -1.0
+        rows.append(row)
+        lbs.append(-np.inf)
+        ubs.append(0.0)
+
+        # Pressure-weighted peak. A break during a 0.50-pressure overlap period
+        # costs half as much as the same break during a normal 1.00-pressure period.
+        row = {var_idx: value * float(pressure_weights[t_idx]) for var_idx, value in load_terms.items()}
+        row[idx_max_weighted] = -1.0
         rows.append(row)
         lbs.append(-np.inf)
         ubs.append(0.0)
@@ -435,12 +612,15 @@ def optimize_pattern_selection(moderators, pattern_sets, vector_sets, timeline_m
 
     if result.x is None:
         chosen, peak, wb_peak = greedy_fallback(
-            moderators, pattern_sets, vector_sets, timeline_len
+            moderators, pattern_sets, vector_sets, timeline_len, pressure_weights
         )
         return {
             "Chosen": chosen,
             "Peak": peak,
             "WB70Peak": wb_peak,
+            "WeightedPeak": float(np.max(pressure_weights * np.sum(
+                [vector_sets[m_idx][0][:, chosen[m_idx]] for m_idx in range(len(moderators))], axis=0
+            ))),
             "UsedFallback": True,
             "SolverMessage": result.message,
         }
@@ -455,6 +635,7 @@ def optimize_pattern_selection(moderators, pattern_sets, vector_sets, timeline_m
         "Chosen": chosen,
         "Peak": int(round(result.x[idx_max_concurrent])),
         "WB70Peak": int(round(result.x[idx_max_wb70])),
+        "WeightedPeak": float(result.x[idx_max_weighted]),
         "UsedFallback": not bool(result.success),
         "SolverMessage": result.message,
     }
@@ -627,6 +808,10 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
                 st.stop()
 
             timeline_mins = list(range(0, total_shift_mins + 1, TIME_STEP))
+            pressure_profile = build_pressure_profile(
+                shift_preset, shift_start_dt, timeline_mins
+            )
+            pressure_weights = pressure_profile["Weight"]
 
             # Each moderator references the cached candidate pool for their profile.
             pattern_sets = []
@@ -652,7 +837,7 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
                 vector_sets.append(vector_cache[mod["Profile"]])
 
             result = optimize_pattern_selection(
-                moderators, pattern_sets, vector_sets, timeline_mins
+                moderators, pattern_sets, vector_sets, timeline_mins, pressure_weights
             )
 
             schedule = []
@@ -694,7 +879,14 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
                 for t_dt in timeline_dts
             ]
             concurrency_df = pd.DataFrame(
-                {"Time": timeline_dts, "Concurrent Breaks": concurrency_counts}
+                {
+                    "Time": timeline_dts,
+                    "Concurrent Breaks": concurrency_counts,
+                    "Pressure Weight": pressure_weights,
+                    "Raw Volume": pressure_profile["RawVolume"],
+                    "Effective Pressure": pressure_profile["EffectivePressure"],
+                    "Pressure Source": pressure_profile["Label"],
+                }
             )
 
             if result["UsedFallback"]:
@@ -707,6 +899,18 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
                 f"✅ Schedule Generated! Peak concurrent breaks: **{result['Peak']}**  |  "
                 f"Peak concurrent WB70s: **{result['WB70Peak']}**"
             )
+            if shift_preset in ("Morning", "Mid"):
+                st.caption(
+                    "Pressure-aware optimization active: 15:00–16:30 Morning/Mid overlap is preferred for concurrency because two shifts are covering the queue."
+                )
+            elif shift_preset == "Night":
+                st.caption(
+                    "Pressure-aware optimization active: concurrent breaks are penalized according to the supplied Night hourly volume profile, with lower-volume hours preferred."
+                )
+            else:
+                st.caption(
+                    "Custom preset uses uniform pressure weighting; optimization still minimizes WB70 overlap and overall concurrency."
+                )
 
             # ==========================================
             # 6. DASHBOARD & VISUALIZATION
@@ -843,6 +1047,50 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
                 height=300,
             )
             st.plotly_chart(fig_concurrency, use_container_width=True)
+
+            st.markdown(
+                "<div style='background-color: #1c2838; color: white; padding: 8px; border-radius: 4px; "
+                "text-align: center; font-size: 18px; font-weight: bold; font-family: Montserrat, sans-serif;'>"
+                "Optimization Pressure Profile</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            pressure_display_df = concurrency_df.copy()
+            pressure_display_df["Relative Pressure"] = pressure_display_df["Pressure Weight"]
+            fig_pressure = px.line(
+                pressure_display_df,
+                x="Time",
+                y="Relative Pressure",
+                hover_data={
+                    "Raw Volume": ":.0f",
+                    "Effective Pressure": ":.0f",
+                    "Pressure Source": True,
+                    "Relative Pressure": ":.3f",
+                },
+            )
+            fig_pressure.update_layout(
+                plot_bgcolor="white",
+                paper_bgcolor="white",
+                font=dict(family="Montserrat, sans-serif", color="black", size=12),
+                xaxis=dict(
+                    showgrid=True,
+                    gridcolor="#e5e5e5",
+                    tickformat="%H:%M",
+                    dtick=3600000,
+                    title="<b>Time</b>",
+                ),
+                yaxis=dict(
+                    showgrid=True,
+                    gridcolor="#f3f4f6",
+                    title="<b>Relative Queue Pressure</b>",
+                    rangemode="tozero",
+                ),
+                margin=dict(l=0, r=0, t=20, b=40),
+                height=280,
+                showlegend=False,
+            )
+            st.plotly_chart(fig_pressure, use_container_width=True)
 
         except Exception as exc:
             st.error(f"An unexpected error occurred during scheduling calculation: {str(exc)}")
