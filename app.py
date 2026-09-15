@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import numpy as np
 import scipy.sparse as sp
 from scipy.optimize import milp, LinearConstraint, Bounds
@@ -416,6 +417,150 @@ def build_pressure_profile(preset_name, shift_start_dt, timeline_mins):
         "Label": coverage_labels,
     }
 
+
+
+def build_break_overlap_heatmap_matrix(schedule, earliest_dt, final_dt):
+    """
+    Build an hour x 5-minute matrix of concurrent breaks.
+
+    Cells outside the allowed break window are NaN so they render blank.
+    Values inside the window are calculated directly from the final optimized
+    schedule, making the heatmap independent of solver internals.
+    """
+    if final_dt <= earliest_dt:
+        return np.empty((0, 12)), [], []
+
+    first_hour = earliest_dt.replace(minute=0, second=0, microsecond=0)
+    last_active_point = final_dt - timedelta(minutes=1)
+    last_hour = last_active_point.replace(minute=0, second=0, microsecond=0)
+
+    hour_starts = []
+    cursor = first_hour
+    while cursor <= last_hour:
+        hour_starts.append(cursor)
+        cursor += timedelta(hours=1)
+
+    minute_marks = list(range(0, 60, TIME_STEP))
+    matrix = np.full((len(hour_starts), len(minute_marks)), np.nan, dtype=float)
+
+    for row_idx, hour_start in enumerate(hour_starts):
+        for col_idx, minute in enumerate(minute_marks):
+            slot_dt = hour_start + timedelta(minutes=minute)
+            if earliest_dt <= slot_dt < final_dt:
+                matrix[row_idx, col_idx] = sum(
+                    1 for b in schedule if b["Start"] <= slot_dt < b["Finish"]
+                )
+
+    row_labels = [dt.strftime("%H:00") for dt in hour_starts]
+    col_labels = [f":{minute:02d}" for minute in minute_marks]
+    return matrix, row_labels, col_labels
+
+
+def create_break_overlap_heatmap(schedule, earliest_dt, final_dt):
+    """Create the management-facing concurrent-break heatmap."""
+    matrix, row_labels, col_labels = build_break_overlap_heatmap_matrix(
+        schedule, earliest_dt, final_dt
+    )
+
+    if matrix.size == 0 or not np.any(~np.isnan(matrix)):
+        return None, 0
+
+    valid_values = matrix[~np.isnan(matrix)]
+    z_min = float(np.min(valid_values))
+    z_max = float(np.max(valid_values))
+
+    # Avoid a zero-width color range when every valid cell has the same value.
+    display_zmax = z_max if z_max > z_min else z_min + 1.0
+
+    # Approved palette: very light dusty pink at the low end, moving through
+    # rose/mauve into saturated deep violet for the highest concurrency.
+    light_pink_to_violet = [
+        [0.00, "#F8CDD8"],
+        [0.20, "#F1B7CF"],
+        [0.40, "#DF91C2"],
+        [0.60, "#C261B4"],
+        [0.80, "#9230A6"],
+        [1.00, "#56006F"],
+    ]
+
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=matrix,
+            x=col_labels,
+            y=row_labels,
+            colorscale=light_pink_to_violet,
+            zmin=z_min,
+            zmax=display_zmax,
+            colorbar=dict(
+                title=dict(text="Concurrent<br>breaks", side="right"),
+                tickmode="linear",
+                dtick=1,
+                thickness=26,
+                len=1.0,
+            ),
+            hovertemplate=(
+                "Hour: %{y}<br>"
+                "5-minute interval: %{x}<br>"
+                "Concurrent breaks: %{z:.0f}"
+                "<extra></extra>"
+            ),
+            hoverongaps=False,
+            showscale=True,
+        )
+    )
+
+    # Add numeric labels with automatic black/white contrast.
+    span = max(display_zmax - z_min, 1.0)
+    for row_idx, row_label in enumerate(row_labels):
+        for col_idx, col_label in enumerate(col_labels):
+            value = matrix[row_idx, col_idx]
+            if np.isnan(value):
+                continue
+            normalized = (float(value) - z_min) / span
+            font_color = "white" if normalized >= 0.52 else "black"
+            fig.add_annotation(
+                x=col_label,
+                y=row_label,
+                text=f"<b>{int(value)}</b>",
+                showarrow=False,
+                font=dict(
+                    family="Montserrat, sans-serif",
+                    size=13,
+                    color=font_color,
+                ),
+            )
+
+    heatmap_height = max(520, len(row_labels) * 78 + 175)
+    fig.update_layout(
+        title=dict(
+            text=(
+                "Concurrent Break Heatmap — Entire Shift "
+                f"({earliest_dt.strftime('%H:%M')}–{final_dt.strftime('%H:%M')})"
+            ),
+            x=0.5,
+            xanchor="center",
+            font=dict(family="Montserrat, sans-serif", size=21, color="black"),
+        ),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        font=dict(family="Montserrat, sans-serif", color="black", size=12),
+        xaxis=dict(
+            title="<b>5-minute interval</b>",
+            side="bottom",
+            showgrid=False,
+            fixedrange=False,
+        ),
+        yaxis=dict(
+            title="<b>Hour</b>",
+            autorange="reversed",
+            showgrid=False,
+            fixedrange=False,
+        ),
+        margin=dict(l=75, r=90, t=85, b=65),
+        height=heatmap_height,
+    )
+
+    return fig, heatmap_height
 
 def pattern_vectors(pattern, durations, timeline_mins):
     """Return total-break and WB70-only active vectors for one candidate pattern."""
@@ -1047,6 +1192,64 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
                 height=300,
             )
             st.plotly_chart(fig_concurrency, use_container_width=True)
+
+            # --- Concurrent Break Heatmap ---
+            st.markdown(
+                "<div style='background-color: #1c2838; color: white; padding: 8px; border-radius: 4px; "
+                "text-align: center; font-size: 18px; font-weight: bold; font-family: Montserrat, sans-serif;'>"
+                "Concurrent Break Heatmap</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.caption(
+                "Management view: each cell shows how many moderators are simultaneously on break "
+                "at that 5-minute point. Lighter pink indicates lower concurrency; deeper violet "
+                "indicates higher concurrency. Cells outside the allowed break window are blank."
+            )
+
+            fig_heatmap, heatmap_height = create_break_overlap_heatmap(
+                schedule, earliest_dt, final_dt
+            )
+
+            if fig_heatmap is not None:
+                safe_shift_start = shift_start_str.replace(":", "")
+                safe_shift_end = shift_end_str.replace(":", "")
+                heatmap_config = {
+                    "toImageButtonOptions": {
+                        "format": "png",
+                        "filename": f"Break_Overlap_Heatmap_{safe_shift_start}_{safe_shift_end}",
+                        "height": heatmap_height,
+                        "width": 1800,
+                        "scale": 3,
+                    },
+                    "displayModeBar": True,
+                }
+                st.plotly_chart(
+                    fig_heatmap, use_container_width=True, config=heatmap_config
+                )
+
+                try:
+                    heatmap_img_bytes = fig_heatmap.to_image(
+                        format="png",
+                        width=1800,
+                        height=heatmap_height,
+                        scale=3,
+                    )
+                    st.download_button(
+                        label="📥 Download High-Resolution Break Heatmap (PNG)",
+                        data=heatmap_img_bytes,
+                        file_name=(
+                            f"Break_Overlap_Heatmap_{safe_shift_start}_{safe_shift_end}.png"
+                        ),
+                        mime="image/png",
+                    )
+                except Exception:
+                    st.info(
+                        "💡 To enable the 1-click heatmap PNG button, ensure kaleido is installed. "
+                        "The Plotly toolbar export still remains available."
+                    )
+            else:
+                st.info("No valid break-window cells were available for the heatmap.")
 
             st.markdown(
                 "<div style='background-color: #1c2838; color: white; padding: 8px; border-radius: 4px; "
