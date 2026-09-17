@@ -18,7 +18,7 @@ st.set_page_config(page_title="Lark Break Planner", layout="wide")
 st.title("Shift Break Optimizer")
 st.markdown(
     "Maximize on-duty staff while strictly enforcing meal windows, shift limits, "
-    "inside-time rules, fixed WB70 times, moderator break entitlements, and queue-pressure-aware break placement."
+    "inside-time rules, fixed WB70 times, per-moderator WB70 durations, moderator break entitlements, and queue-pressure-aware break placement."
 )
 
 # ==========================================
@@ -792,28 +792,50 @@ def optimize_pattern_selection(moderators, pattern_sets, vector_sets, timeline_m
 st.subheader("Moderator List & Entitlements")
 st.caption(
     "Break order is fully arbitrary. Meal Exception is automatic: if WB70s > 0, "
-    "that moderator's Meal is not restricted to the normal Meal Window."
+    "that moderator's Meal is not restricted to the normal Meal Window. "
+    "WB70 Duration (mins) is optional: leave it blank to use the universal WB70 duration from the sidebar, "
+    "or enter a moderator-specific duration such as 40, 50 or 60 minutes."
 )
 
 default_data = [
-    {"Name": "Alper Uçar", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "Fixed WB70 Start": ""},
-    {"Name": "Arda Su Topcu", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "Fixed WB70 Start": ""},
-    {"Name": "Asiye Sağir", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "Fixed WB70 Start": ""},
-    {"Name": "Baki Doğan", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "Fixed WB70 Start": ""},
-    {"Name": "Çağtay Kaplan", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "Fixed WB70 Start": ""},
-    {"Name": "Damla Özçelik", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "Fixed WB70 Start": ""},
-    {"Name": "Ege Saritaş", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "Fixed WB70 Start": ""},
-    {"Name": "Ege Solaker", "Shorts": 3, "Meals": 1, "WB20s": 0, "WB70s": 1, "Fixed WB70 Start": ""},
-    {"Name": "Gökay Deniz Akçayöz", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "Fixed WB70 Start": ""},
-    {"Name": "Gülsena Kaya", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "Fixed WB70 Start": ""},
-    {"Name": "Hilay Özgü Öztürk", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "Fixed WB70 Start": ""},
-    {"Name": "İrem Kındıra", "Shorts": 3, "Meals": 1, "WB20s": 0, "WB70s": 1, "Fixed WB70 Start": ""},
-    {"Name": "Kadirhan Tekin", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "Fixed WB70 Start": ""},
-    {"Name": "Saim Varol", "Shorts": 3, "Meals": 1, "WB20s": 0, "WB70s": 1, "Fixed WB70 Start": ""},
-    {"Name": "Zeynep Öykü Ercan", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "Fixed WB70 Start": ""},
+    {"Name": "Alper Uçar", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": ""},
+    {"Name": "Arda Su Topcu", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": ""},
+    {"Name": "Asiye Sağir", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": ""},
+    {"Name": "Baki Doğan", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": ""},
+    {"Name": "Çağtay Kaplan", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": ""},
+    {"Name": "Damla Özçelik", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": ""},
+    {"Name": "Ege Saritaş", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": ""},
+    {"Name": "Ege Solaker", "Shorts": 3, "Meals": 1, "WB20s": 0, "WB70s": 1, "WB70 Duration (mins)": None, "Fixed WB70 Start": ""},
+    {"Name": "Gökay Deniz Akçayöz", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": ""},
+    {"Name": "Gülsena Kaya", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": ""},
+    {"Name": "Hilay Özgü Öztürk", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": ""},
+    {"Name": "İrem Kındıra", "Shorts": 3, "Meals": 1, "WB20s": 0, "WB70s": 1, "WB70 Duration (mins)": None, "Fixed WB70 Start": ""},
+    {"Name": "Kadirhan Tekin", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": ""},
+    {"Name": "Saim Varol", "Shorts": 3, "Meals": 1, "WB20s": 0, "WB70s": 1, "WB70 Duration (mins)": None, "Fixed WB70 Start": ""},
+    {"Name": "Zeynep Öykü Ercan", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": ""},
 ]
 
-edited_df = st.data_editor(pd.DataFrame(default_data), num_rows="dynamic", use_container_width=True)
+edited_df = st.data_editor(
+    pd.DataFrame(default_data),
+    num_rows="dynamic",
+    use_container_width=True,
+    column_config={
+        "WB70 Duration (mins)": st.column_config.NumberColumn(
+            "WB70 Duration (mins)",
+            help=(
+                "Optional moderator-specific WB70 duration. Leave blank to use the universal WB70 duration "
+                "from the sidebar. Examples: 40, 50, 60."
+            ),
+            min_value=5,
+            step=5,
+            format="%d",
+        ),
+        "Fixed WB70 Start": st.column_config.TextColumn(
+            "Fixed WB70 Start",
+            help="Optional exact WB70 start time in HH:MM format.",
+        ),
+    },
+)
 
 # ==========================================
 # 5. SOLVER ENGINE
@@ -896,6 +918,34 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
                 if sum(counts.values()) == 0:
                     continue
 
+                # Optional per-moderator WB70 duration override.
+                # Blank = use the universal WB70 duration configured in the sidebar.
+                wb70_duration_raw = row.get("WB70 Duration (mins)", None)
+                wb70_duration_override = None
+                if wb70_duration_raw is not None and not pd.isna(wb70_duration_raw) and str(wb70_duration_raw).strip() != "":
+                    try:
+                        numeric_duration = float(wb70_duration_raw)
+                        if not numeric_duration.is_integer() or numeric_duration <= 0:
+                            raise ValueError
+                        wb70_duration_override = int(numeric_duration)
+                    except Exception:
+                        st.error(
+                            f"❌ {name} has an invalid WB70 Duration. Enter a positive whole number of minutes "
+                            "(for example 40, 50 or 60), or leave the field blank."
+                        )
+                        st.stop()
+
+                if wb70_duration_override is not None and counts["WB70"] == 0:
+                    st.error(
+                        f"❌ {name} has a WB70 Duration override but WB70s is 0. "
+                        "Either clear the duration override or give the moderator a WB70 entitlement."
+                    )
+                    st.stop()
+
+                effective_durations = dict(DURATIONS)
+                if counts["WB70"] > 0 and wb70_duration_override is not None:
+                    effective_durations["WB70"] = wb70_duration_override
+
                 fixed_dt = adjust_dt(parse_time(row.get("Fixed WB70 Start", ""), base_dt))
                 fixed_mins = None
                 if fixed_dt is not None:
@@ -910,13 +960,14 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
 
                 profile = (
                     tuple((b, counts[b]) for b in BREAK_TYPES),
+                    tuple((b, effective_durations[b]) for b in BREAK_TYPES),
                     fixed_mins,
                 )
 
                 if profile not in profile_cache:
                     patterns = build_candidate_patterns(
                         counts=counts,
-                        durations=DURATIONS,
+                        durations=effective_durations,
                         total_shift_mins=total_shift_mins,
                         earliest_mins=earliest_mins,
                         final_mins=final_mins,
@@ -932,7 +983,9 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
                 if not patterns:
                     extra = ""
                     if fixed_mins is not None:
-                        extra = f" Fixed WB70 start: {row.get('Fixed WB70 Start', '')}."
+                        extra += f" Fixed WB70 start: {row.get('Fixed WB70 Start', '')}."
+                    if counts["WB70"] > 0:
+                        extra += f" WB70 duration: {effective_durations['WB70']} minutes."
                     st.error(
                         f"❌ No individually feasible break layout exists for {name} under the current rules.{extra} "
                         "This is a genuine moderator-level rule conflict, not a solver timeout."
@@ -943,6 +996,8 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
                     {
                         "Name": name,
                         "Counts": counts,
+                        "Durations": effective_durations,
+                        "WB70DurationOverride": wb70_duration_override,
                         "FixedWB70": fixed_mins,
                         "Profile": profile,
                     }
@@ -971,7 +1026,7 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
                     active_cols = []
                     wb_cols = []
                     for pattern in patterns:
-                        a, w = pattern_vectors(pattern, DURATIONS, timeline_mins)
+                        a, w = pattern_vectors(pattern, mod["Durations"], timeline_mins)
                         active_cols.append(a)
                         wb_cols.append(w)
                     vector_cache[mod["Profile"]] = (
@@ -990,8 +1045,8 @@ if st.button("🚀 Generate Optimized Schedule", type="primary"):
                 pattern = pattern_sets[m_idx][result["Chosen"][m_idx]]
                 for b_type, start_min in zip(pattern["Order"], pattern["Starts"]):
                     start_dt = shift_start_dt + timedelta(minutes=int(start_min))
-                    end_dt = start_dt + timedelta(minutes=DURATIONS[b_type])
-                    duration_mins = DURATIONS[b_type]
+                    duration_mins = mod["Durations"][b_type]
+                    end_dt = start_dt + timedelta(minutes=duration_mins)
                     start_str = start_dt.strftime("%H:%M")
                     end_str = end_dt.strftime("%H:%M")
 
