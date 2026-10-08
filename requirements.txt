@@ -4,3 +4,5 @@ plotly
 numpy
 scipy
 kaleido
+gspread>=6.0
+google-auth>=2.0
