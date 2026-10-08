@@ -15,8 +15,12 @@ import json
 import os
 import re
 import calendar as pycalendar
+import uuid
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+import gspread
+from google.oauth2.service_account import Credentials
 
 # ==========================================
 # 1. PAGE CONFIGURATION, NAVIGATION & CONSTANTS
@@ -58,15 +62,27 @@ MIP_REL_GAP = 0.05
 BASE_VOLUME = 1836.0
 OVERLAP_COVERAGE_FACTOR = 0.50
 TURKEY_TZ = ZoneInfo("Europe/Istanbul")
-DB_PATH = os.environ.get(
+GOOGLE_SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+SCHEDULES_SHEET_NAME = "Schedules"
+BREAKS_SHEET_NAME = "Breaks"
+LEGACY_DB_PATH = os.environ.get(
     "BREAK_PLANNER_DB_PATH",
     str(Path.cwd() / "break_schedules.db"),
 )
 
+SCHEDULE_HEADERS = [
+    "schedule_id", "schedule_date", "shift_name", "power_unit", "revision", "is_current",
+    "uploader", "uploaded_at", "restored_from_revision", "shift_start", "shift_end",
+    "earliest_iso", "final_iso", "peak_concurrent", "peak_wb70", "ticket_moderator_count",
+]
+BREAK_HEADERS = [
+    "schedule_id", "moderator", "ticket_moderator", "break_type", "start_iso", "finish_iso", "bar_text"
+]
+
 st.sidebar.title("Navigation")
 page = st.sidebar.radio(
     "Page",
-    ["Break Planner", "Schedule Calendar"],
+    ["Break Planner", "Schedule Calendar", "Storage & Setup"],
     index=0,
 )
 
@@ -75,7 +91,8 @@ if page == "Break Planner":
     st.markdown(
         "Maximize on-duty staff while strictly enforcing meal windows, shift limits, "
         "inside-time rules, fixed WB70 times, per-moderator WB70 durations, moderator break entitlements, "
-        "and queue-pressure-aware break placement. Meal breaks are never allowed to be the first break."
+        "ticket coverage, and queue-pressure-aware break placement. Meal breaks are never allowed to be the first break, "
+        "and non-fixed WB70s can optionally be restricted to the first half of the shift."
     )
 
     # ==========================================
@@ -144,6 +161,22 @@ if page == "Break Planner":
     dur_wb20 = int(st.sidebar.number_input("WB20 Break", value=20, step=5))
     dur_wb70 = int(st.sidebar.number_input("WB70 Break", value=70, step=5))
 
+    st.sidebar.subheader("WB70 Placement")
+    allow_wb70_second_half = st.sidebar.toggle(
+        "Allow WB70s in second half of shift",
+        value=False,
+        help=(
+            "When off, every non-fixed WB70 must finish by the exact midpoint of the shift. "
+            "A moderator with a Fixed WB70 Start always follows that fixed time, even if it falls in or extends into the second half."
+        ),
+    )
+    if allow_wb70_second_half:
+        st.sidebar.caption("WB70 placement: second-half WB70s are allowed.")
+    else:
+        st.sidebar.caption(
+            "WB70 placement: non-fixed WB70s must finish by the shift midpoint. Fixed WB70 times override this rule."
+        )
+
     if shift_preset in ("Morning", "Mid"):
         st.sidebar.caption(
             "Pressure model: base volume 1836. The 15:00–16:30 Morning/Mid overlap is treated as two-shift coverage (50% relative pressure)."
@@ -163,11 +196,17 @@ if page == "Break Planner":
         "WB20": dur_wb20,
         "WB70": dur_wb70,
     }
-else:
+elif page == "Schedule Calendar":
     st.title("Saved Break Schedule Calendar")
     st.markdown(
-        "Choose a date to view the prepared break schedules saved for each Shift and Power Unit, "
-        "including who uploaded the latest version and when it was uploaded."
+        "Choose a date to view the current prepared break schedules for each Shift and Power Unit. "
+        "Every save is retained as a revision, so an older version can be reviewed or restored without data loss."
+    )
+else:
+    st.title("Storage & Setup")
+    st.markdown(
+        "Schedule storage uses a private Google Sheet instead of Streamlit's temporary local disk. "
+        "This page checks the connection and provides a one-time migration option for legacy SQLite schedules."
     )
 
 # ==========================================
@@ -191,6 +230,14 @@ def safe_nonnegative_int(value):
         return max(0, int(value))
     except Exception:
         return 0
+
+
+def safe_bool(value):
+    if isinstance(value, bool):
+        return value
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return False
+    return str(value).strip().lower() in {"true", "1", "yes", "y", "x", "checked"}
 
 
 def ceil_step(value, step=TIME_STEP):
@@ -241,6 +288,7 @@ def build_candidate_patterns(
     min_inside,
     max_inside,
     fixed_wb70_mins,
+    allow_wb70_second_half,
     max_patterns=MAX_PATTERNS_PER_PROFILE,
 ):
     """
@@ -253,6 +301,8 @@ def build_candidate_patterns(
       - min/max inside time before, between and after breaks
       - normal Meal Window unless WB70 exists
       - exact Fixed WB70 start when provided
+      - optional first-half-only WB70 placement for non-fixed WB70s
+      - fixed WB70 times override the first-half-only setting
       - 5-minute break-start grid
 
     The global optimizer then only chooses WHICH valid candidate each moderator uses.
@@ -279,6 +329,7 @@ def build_candidate_patterns(
         min_inside,
         max_inside,
         fixed_wb70_mins,
+        bool(allow_wb70_second_half),
     )
     rng = random.Random(profile_seed(profile_key))
     rng.shuffle(orders)
@@ -334,6 +385,7 @@ def build_candidate_patterns(
                     return
 
                 if b_type == "WB70" and fixed_wb70_mins is not None:
+                    # Fixed WB70 always overrides the first-half-only setting.
                     if (
                         fixed_wb70_mins < low
                         or fixed_wb70_mins > high
@@ -343,6 +395,14 @@ def build_candidate_patterns(
                     else:
                         candidate_starts = [fixed_wb70_mins]
                 else:
+                    if b_type == "WB70" and not allow_wb70_second_half:
+                        # "Not allowed in the second half" means the entire non-fixed
+                        # WB70 must be complete by the exact midpoint of the shift.
+                        shift_midpoint = total_shift_mins / 2.0
+                        latest_first_half_start = floor_step(shift_midpoint - dur)
+                        high = min(high, latest_first_half_start)
+                        if high < low:
+                            return
                     candidate_starts = list(range(low, high + 1, TIME_STEP))
                     rng.shuffle(candidate_starts)
 
@@ -725,48 +785,97 @@ def pattern_vectors(pattern, durations, timeline_mins):
 
 
 def greedy_fallback(moderators, pattern_sets, vector_sets, timeline_len, pressure_weights):
-    """Always produce a complete feasible selection if individual candidates exist."""
-    overall = np.zeros(timeline_len, dtype=float)
-    wb70 = np.zeros(timeline_len, dtype=float)
-    chosen = {}
+    """Produce a complete feasible fallback while honoring the ticket-coverage hard rule."""
+    ticket_indices = [i for i, mod in enumerate(moderators) if mod.get("TicketModerator", False)]
+    ticket_count = len(ticket_indices)
+    rng = random.Random(99173)
+    best_solution = None
+    best_score = None
 
-    # Place WB70 moderators first because they are operationally more restrictive.
-    order = sorted(
-        range(len(moderators)),
-        key=lambda i: moderators[i]["Counts"].get("WB70", 0),
-        reverse=True,
-    )
+    # Multi-start greedy reduces the chance that an early pattern choice blocks the last ticket moderator.
+    for attempt in range(30):
+        overall = np.zeros(timeline_len, dtype=float)
+        wb70 = np.zeros(timeline_len, dtype=float)
+        ticket_active = np.zeros(timeline_len, dtype=float)
+        chosen = {}
 
-    for m_idx in order:
-        best_idx = None
-        best_score = None
-        active_mat, wb_mat = vector_sets[m_idx]
-
-        for p_idx in range(active_mat.shape[1]):
-            new_overall = overall + active_mat[:, p_idx]
-            new_wb = wb70 + wb_mat[:, p_idx]
-            # Pressure-aware priority structure:
-            # 1) avoid WB70 stacking
-            # 2) minimize the worst pressure-weighted staffing loss
-            # 3) keep the absolute concurrency peak sensible
-            # 4) smooth remaining breaks with greater penalties in high-pressure periods
-            weighted_load = pressure_weights * new_overall
-            score = (
-                1_000_000 * np.max(new_wb)
-                + 100_000 * np.max(weighted_load)
-                + 30_000 * np.max(new_overall)
-                + np.sum(pressure_weights * (new_overall * (new_overall + 1) / 2))
+        # Ticket moderators are placed first, then WB70-heavy moderators.
+        order = list(range(len(moderators)))
+        if attempt == 0:
+            order.sort(
+                key=lambda i: (
+                    1 if moderators[i].get("TicketModerator", False) else 0,
+                    moderators[i]["Counts"].get("WB70", 0),
+                ),
+                reverse=True,
             )
-            if best_score is None or score < best_score:
-                best_score = score
-                best_idx = p_idx
+        else:
+            rng.shuffle(order)
+            order.sort(key=lambda i: 1 if moderators[i].get("TicketModerator", False) else 0, reverse=True)
 
-        chosen[m_idx] = best_idx
-        overall += active_mat[:, best_idx]
-        wb70 += wb_mat[:, best_idx]
+        failed = False
+        for m_idx in order:
+            best_idx = None
+            local_best_score = None
+            active_mat, wb_mat = vector_sets[m_idx]
+            candidate_order = list(range(active_mat.shape[1]))
+            if attempt:
+                rng.shuffle(candidate_order)
 
-    return chosen, int(np.max(overall)), int(np.max(wb70))
+            for p_idx in candidate_order:
+                candidate_active = active_mat[:, p_idx]
+                if moderators[m_idx].get("TicketModerator", False) and ticket_count >= 2:
+                    candidate_ticket = ticket_active + candidate_active
+                    if np.any(candidate_ticket >= ticket_count - 1e-9):
+                        continue
 
+                new_overall = overall + candidate_active
+                new_wb = wb70 + wb_mat[:, p_idx]
+                weighted_load = pressure_weights * new_overall
+                score = (
+                    1_000_000 * np.max(new_wb)
+                    + 100_000 * np.max(weighted_load)
+                    + 30_000 * np.max(new_overall)
+                    + np.sum(pressure_weights * (new_overall * (new_overall + 1) / 2))
+                )
+                if attempt:
+                    score += rng.random() * 0.001
+                if local_best_score is None or score < local_best_score:
+                    local_best_score = score
+                    best_idx = p_idx
+
+            if best_idx is None:
+                failed = True
+                break
+
+            chosen[m_idx] = best_idx
+            overall += active_mat[:, best_idx]
+            wb70 += wb_mat[:, best_idx]
+            if moderators[m_idx].get("TicketModerator", False):
+                ticket_active += active_mat[:, best_idx]
+
+        if failed or len(chosen) != len(moderators):
+            continue
+
+        if ticket_count >= 2 and np.any(ticket_active >= ticket_count - 1e-9):
+            continue
+
+        final_score = (
+            1_000_000 * np.max(wb70)
+            + 100_000 * np.max(pressure_weights * overall)
+            + 30_000 * np.max(overall)
+            + np.sum(pressure_weights * (overall * (overall + 1) / 2))
+        )
+        if best_score is None or final_score < best_score:
+            best_score = final_score
+            best_solution = (chosen, int(np.max(overall)), int(np.max(wb70)))
+
+    if best_solution is None:
+        raise RuntimeError(
+            "The fallback scheduler could not find a ticket-safe complete schedule. "
+            "Try generating again or widening the break rules."
+        )
+    return best_solution
 
 def optimize_pattern_selection(moderators, pattern_sets, vector_sets, timeline_mins, pressure_weights):
     """
@@ -777,6 +886,7 @@ def optimize_pattern_selection(moderators, pattern_sets, vector_sets, timeline_m
     """
     moderator_count = len(moderators)
     timeline_len = len(timeline_mins)
+    ticket_count = sum(1 for mod in moderators if mod.get("TicketModerator", False))
 
     # One binary variable for every moderator/candidate-pattern pair.
     y_offsets = []
@@ -838,6 +948,7 @@ def optimize_pattern_selection(moderators, pattern_sets, vector_sets, timeline_m
     for t_idx in range(timeline_len):
         load_terms = {}
         wb_terms = {}
+        ticket_terms = {}
 
         for m_idx in range(moderator_count):
             active_mat, wb_mat = vector_sets[m_idx]
@@ -847,6 +958,8 @@ def optimize_pattern_selection(moderators, pattern_sets, vector_sets, timeline_m
                 w = wb_mat[t_idx, p_idx]
                 if a:
                     load_terms[off + p_idx] = float(a)
+                    if moderators[m_idx].get("TicketModerator", False):
+                        ticket_terms[off + p_idx] = float(a)
                 if w:
                     wb_terms[off + p_idx] = float(w)
 
@@ -869,6 +982,13 @@ def optimize_pattern_selection(moderators, pattern_sets, vector_sets, timeline_m
         rows.append(row)
         lbs.append(-np.inf)
         ubs.append(0.0)
+
+        # Hard ticket-coverage rule: at every 5-minute point, at least one designated
+        # ticket moderator must remain on duty.
+        if ticket_count >= 2:
+            rows.append(dict(ticket_terms))
+            lbs.append(-np.inf)
+            ubs.append(float(ticket_count - 1))
 
         row = dict(load_terms)
         for k in range(moderator_count):
@@ -934,86 +1054,102 @@ def optimize_pattern_selection(moderators, pattern_sets, vector_sets, timeline_m
 
 
 # ==========================================
-# 4. SAVED-SCHEDULE STORAGE & CALENDAR
+# 4. GOOGLE SHEETS STORAGE, REVISION HISTORY & MIGRATION
 # ==========================================
-def get_db_connection():
-    """Open the persistent local schedule database and ensure its parent exists."""
-    db_path = Path(DB_PATH)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path), timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 30000")
+def _service_account_info():
+    """Read Google service-account credentials from Streamlit Secrets or an environment JSON blob."""
+    env_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    if env_json:
+        info = json.loads(env_json)
+    else:
+        try:
+            info = dict(st.secrets["gcp_service_account"])
+        except Exception as exc:
+            raise RuntimeError(
+                "Google Sheets credentials are not configured. Add [gcp_service_account] to Streamlit Secrets."
+            ) from exc
+    if "private_key" in info and isinstance(info["private_key"], str):
+        info["private_key"] = info["private_key"].replace("\\n", "\n")
+    return info
+
+
+def get_spreadsheet_id():
+    env_id = os.environ.get("BREAK_PLANNER_SPREADSHEET_ID", "").strip()
+    if env_id:
+        return env_id
     try:
-        conn.execute("PRAGMA journal_mode = WAL")
-    except sqlite3.DatabaseError:
+        value = str(st.secrets["break_planner"]["spreadsheet_id"]).strip()
+        if value:
+            return value
+    except Exception:
         pass
-    return conn
+    raise RuntimeError(
+        "Google Sheets spreadsheet_id is not configured. Add [break_planner] spreadsheet_id to Streamlit Secrets."
+    )
 
 
-def init_schedule_db():
-    with get_db_connection() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS saved_schedules (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                schedule_date TEXT NOT NULL,
-                shift_name TEXT NOT NULL,
-                power_unit TEXT NOT NULL,
-                uploader TEXT,
-                uploaded_at TEXT NOT NULL,
-                shift_start TEXT NOT NULL,
-                shift_end TEXT NOT NULL,
-                earliest_iso TEXT NOT NULL,
-                final_iso TEXT NOT NULL,
-                schedule_json TEXT NOT NULL,
-                peak_concurrent INTEGER,
-                peak_wb70 INTEGER,
-                UNIQUE(schedule_date, shift_name, power_unit)
-            )
-            """
+@st.cache_resource(show_spinner=False)
+def get_gspread_client():
+    credentials = Credentials.from_service_account_info(
+        _service_account_info(), scopes=GOOGLE_SHEETS_SCOPES
+    )
+    return gspread.authorize(credentials)
+
+
+@st.cache_resource(show_spinner=False)
+def get_break_planner_spreadsheet():
+    return get_gspread_client().open_by_key(get_spreadsheet_id())
+
+
+def _get_or_create_worksheet(spreadsheet, title, headers, rows=2000):
+    try:
+        ws = spreadsheet.worksheet(title)
+    except gspread.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=title, rows=rows, cols=max(20, len(headers) + 2))
+        ws.append_row(headers, value_input_option="RAW")
+        return ws
+
+    first_row = ws.row_values(1)
+    if not first_row:
+        ws.append_row(headers, value_input_option="RAW")
+    elif first_row[: len(headers)] != headers:
+        raise RuntimeError(
+            f"Worksheet '{title}' has unexpected headers. Expected: {', '.join(headers)}"
         )
-        conn.commit()
+    return ws
 
 
-def serialize_schedule(schedule):
-    payload = []
-    for item in schedule:
-        name = item.get("Name")
-        if not name:
-            name = re.sub(r"<[^>]+>", "", str(item.get("Task", "")))
-        payload.append(
-            {
-                "Name": name,
-                "Resource": item["Resource"],
-                "Start": item["Start"].isoformat(),
-                "Finish": item["Finish"].isoformat(),
-                "Bar_Text": item.get("Bar_Text", ""),
-            }
-        )
-    return json.dumps(payload, ensure_ascii=False)
+def get_storage_worksheets():
+    spreadsheet = get_break_planner_spreadsheet()
+    schedules_ws = _get_or_create_worksheet(spreadsheet, SCHEDULES_SHEET_NAME, SCHEDULE_HEADERS)
+    breaks_ws = _get_or_create_worksheet(spreadsheet, BREAKS_SHEET_NAME, BREAK_HEADERS, rows=10000)
+    return spreadsheet, schedules_ws, breaks_ws
 
 
-def deserialize_schedule(schedule_json):
-    raw = json.loads(schedule_json)
-    schedule = []
-    for item in raw:
-        start_dt = datetime.fromisoformat(item["Start"])
-        finish_dt = datetime.fromisoformat(item["Finish"])
-        name = item.get("Name", "")
-        bar_text = item.get("Bar_Text") or (
-            f"<b>{start_dt.strftime('%H:%M')}-{finish_dt.strftime('%H:%M')}</b>"
-        )
-        schedule.append(
-            {
-                "Name": name,
-                "Task": f"<b>{name}</b>",
-                "Resource": item["Resource"],
-                "Start": start_dt,
-                "Finish": finish_dt,
-                "Bar_Text": bar_text,
-            }
-        )
-    return schedule
+def storage_connection_status():
+    spreadsheet, schedules_ws, breaks_ws = get_storage_worksheets()
+    return {
+        "title": spreadsheet.title,
+        "spreadsheet_id": get_spreadsheet_id(),
+        "schedules_rows": max(0, schedules_ws.row_count - 1),
+        "breaks_rows": max(0, breaks_ws.row_count - 1),
+    }
+
+
+def _records(ws):
+    return ws.get_all_records(default_blank="")
+
+
+def _mark_previous_current_false(schedules_ws, records, schedule_date, shift_name, power_unit):
+    current_col = SCHEDULE_HEADERS.index("is_current") + 1
+    for row_number, row in enumerate(records, start=2):
+        if (
+            str(row.get("schedule_date", "")) == schedule_date
+            and str(row.get("shift_name", "")).strip() == shift_name
+            and str(row.get("power_unit", "")).strip() == power_unit
+            and safe_bool(row.get("is_current", False))
+        ):
+            schedules_ws.update_cell(row_number, current_col, "FALSE")
 
 
 def save_schedule_record(
@@ -1028,101 +1164,262 @@ def save_schedule_record(
     schedule,
     peak_concurrent,
     peak_wb70,
+    restored_from_revision="",
+    uploaded_at_override=None,
 ):
-    """Create or replace the current schedule for one Date + Shift + Power Unit."""
-    init_schedule_db()
-    uploaded_at = datetime.now(TURKEY_TZ).isoformat(timespec="seconds")
-    date_text = schedule_date.strftime("%Y-%m-%d")
+    """Append a new immutable revision and mark it as current for Date + Shift + PU."""
+    _, schedules_ws, breaks_ws = get_storage_worksheets()
+    existing = _records(schedules_ws)
+
+    date_text = schedule_date.strftime("%Y-%m-%d") if hasattr(schedule_date, "strftime") else str(schedule_date)
     shift_name = str(shift_name).strip()
     power_unit = str(power_unit).strip()
     uploader = str(uploader or "").strip()
 
-    with get_db_connection() as conn:
-        existed = conn.execute(
-            """
-            SELECT id FROM saved_schedules
-            WHERE schedule_date = ? AND shift_name = ? AND power_unit = ?
-            """,
-            (date_text, shift_name, power_unit),
-        ).fetchone() is not None
+    matching = [
+        r for r in existing
+        if str(r.get("schedule_date", "")) == date_text
+        and str(r.get("shift_name", "")).strip() == shift_name
+        and str(r.get("power_unit", "")).strip() == power_unit
+    ]
+    revisions = []
+    for r in matching:
+        try:
+            revisions.append(int(float(r.get("revision", 0) or 0)))
+        except Exception:
+            pass
+    revision = (max(revisions) if revisions else 0) + 1
+    schedule_id = uuid.uuid4().hex
+    uploaded_at = uploaded_at_override or datetime.now(TURKEY_TZ).isoformat(timespec="seconds")
+    ticket_names = {
+        item.get("Name") or re.sub(r"<[^>]+>", "", str(item.get("Task", "")))
+        for item in schedule
+        if safe_bool(item.get("TicketModerator", False))
+    }
 
-        conn.execute(
-            """
-            INSERT INTO saved_schedules (
-                schedule_date, shift_name, power_unit, uploader, uploaded_at,
-                shift_start, shift_end, earliest_iso, final_iso, schedule_json,
-                peak_concurrent, peak_wb70
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(schedule_date, shift_name, power_unit) DO UPDATE SET
-                uploader = excluded.uploader,
-                uploaded_at = excluded.uploaded_at,
-                shift_start = excluded.shift_start,
-                shift_end = excluded.shift_end,
-                earliest_iso = excluded.earliest_iso,
-                final_iso = excluded.final_iso,
-                schedule_json = excluded.schedule_json,
-                peak_concurrent = excluded.peak_concurrent,
-                peak_wb70 = excluded.peak_wb70
-            """,
-            (
-                date_text,
-                shift_name,
-                power_unit,
-                uploader,
-                uploaded_at,
-                shift_start,
-                shift_end,
-                earliest_dt.isoformat(),
-                final_dt.isoformat(),
-                serialize_schedule(schedule),
-                int(peak_concurrent),
-                int(peak_wb70),
-            ),
-        )
-        conn.commit()
-    return uploaded_at, existed
+    # Write break rows first. If the final schedule-row append fails, these rows are harmless orphans
+    # because Calendar records are discovered from the Schedules tab only.
+    break_rows = []
+    for item in sorted(schedule, key=lambda x: (x.get("Name", ""), x["Start"])):
+        name = item.get("Name") or re.sub(r"<[^>]+>", "", str(item.get("Task", "")))
+        break_rows.append([
+            schedule_id,
+            name,
+            "TRUE" if safe_bool(item.get("TicketModerator", False)) else "FALSE",
+            item["Resource"],
+            item["Start"].isoformat(),
+            item["Finish"].isoformat(),
+            item.get("Bar_Text", ""),
+        ])
+    if break_rows:
+        breaks_ws.append_rows(break_rows, value_input_option="RAW")
+
+    schedules_ws.append_row([
+        schedule_id,
+        date_text,
+        shift_name,
+        power_unit,
+        revision,
+        "TRUE",
+        uploader,
+        uploaded_at,
+        restored_from_revision,
+        shift_start,
+        shift_end,
+        earliest_dt.isoformat(),
+        final_dt.isoformat(),
+        int(peak_concurrent),
+        int(peak_wb70),
+        len(ticket_names),
+    ], value_input_option="RAW")
+
+    # Only after the new revision exists do we retire the previous current revision(s).
+    _mark_previous_current_false(schedules_ws, existing, date_text, shift_name, power_unit)
+    return uploaded_at, revision, bool(matching)
+
+
+def load_all_schedule_records():
+    _, schedules_ws, _ = get_storage_worksheets()
+    return _records(schedules_ws)
+
+
+def _revision_number(record):
+    try:
+        return int(float(record.get("revision", 0) or 0))
+    except Exception:
+        return 0
 
 
 def load_schedules_for_date(selected_date):
-    init_schedule_db()
-    date_text = (
-        selected_date.strftime("%Y-%m-%d")
-        if hasattr(selected_date, "strftime")
-        else str(selected_date)
-    )
+    date_text = selected_date.strftime("%Y-%m-%d") if hasattr(selected_date, "strftime") else str(selected_date)
+    records = [r for r in load_all_schedule_records() if str(r.get("schedule_date", "")) == date_text]
+
+    # Prefer explicitly-current records. If an interrupted update ever leaves two current rows,
+    # keep only the highest revision for each Date + Shift + PU.
+    grouped = {}
+    for record in records:
+        if not safe_bool(record.get("is_current", False)):
+            continue
+        key = (record.get("schedule_date", ""), record.get("shift_name", ""), record.get("power_unit", ""))
+        if key not in grouped or _revision_number(record) > _revision_number(grouped[key]):
+            grouped[key] = record
+
     shift_order = {"Morning": 0, "Mid": 1, "Night": 2}
-    with get_db_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT * FROM saved_schedules
-            WHERE schedule_date = ?
-            ORDER BY shift_name COLLATE NOCASE, power_unit COLLATE NOCASE
-            """,
-            (date_text,),
-        ).fetchall()
-    records = [dict(row) for row in rows]
-    records.sort(key=lambda r: (shift_order.get(r["shift_name"], 9), r["shift_name"].lower(), r["power_unit"].lower()))
-    return records
+    current = list(grouped.values())
+    current.sort(key=lambda r: (
+        shift_order.get(str(r.get("shift_name", "")), 9),
+        str(r.get("shift_name", "")).lower(),
+        str(r.get("power_unit", "")).lower(),
+    ))
+    return current
 
 
 def load_schedule_counts_for_month(year, month):
-    init_schedule_db()
-    month_start = f"{year:04d}-{month:02d}-01"
-    if month == 12:
-        next_month = f"{year + 1:04d}-01-01"
-    else:
-        next_month = f"{year:04d}-{month + 1:02d}-01"
-    with get_db_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT schedule_date, COUNT(*) AS schedule_count
-            FROM saved_schedules
-            WHERE schedule_date >= ? AND schedule_date < ?
-            GROUP BY schedule_date
-            """,
-            (month_start, next_month),
-        ).fetchall()
-    return {row["schedule_date"]: int(row["schedule_count"]) for row in rows}
+    prefix = f"{year:04d}-{month:02d}-"
+    current = [r for r in load_all_schedule_records() if safe_bool(r.get("is_current", False))]
+    unique = {}
+    for r in current:
+        if not str(r.get("schedule_date", "")).startswith(prefix):
+            continue
+        key = (r.get("schedule_date", ""), r.get("shift_name", ""), r.get("power_unit", ""))
+        if key not in unique or _revision_number(r) > _revision_number(unique[key]):
+            unique[key] = r
+    counts = {}
+    for r in unique.values():
+        date_text = str(r.get("schedule_date", ""))
+        counts[date_text] = counts.get(date_text, 0) + 1
+    return counts
+
+
+def load_break_rows_for_schedule_ids(schedule_ids):
+    ids = {str(x) for x in schedule_ids}
+    if not ids:
+        return {}
+    _, _, breaks_ws = get_storage_worksheets()
+    all_rows = _records(breaks_ws)
+    grouped = {sid: [] for sid in ids}
+    for row in all_rows:
+        sid = str(row.get("schedule_id", ""))
+        if sid in ids:
+            grouped.setdefault(sid, []).append(row)
+    return grouped
+
+
+def schedule_from_break_rows(rows):
+    schedule = []
+    for item in rows:
+        start_dt = datetime.fromisoformat(str(item["start_iso"]))
+        finish_dt = datetime.fromisoformat(str(item["finish_iso"]))
+        name = str(item.get("moderator", ""))
+        bar_text = str(item.get("bar_text", "")) or f"<b>{start_dt.strftime('%H:%M')}-{finish_dt.strftime('%H:%M')}</b>"
+        schedule.append({
+            "Name": name,
+            "Task": f"<b>{name}</b>",
+            "Resource": str(item.get("break_type", "")),
+            "Start": start_dt,
+            "Finish": finish_dt,
+            "Bar_Text": bar_text,
+            "TicketModerator": safe_bool(item.get("ticket_moderator", False)),
+        })
+    return schedule
+
+
+def load_schedule_revisions(schedule_date, shift_name, power_unit):
+    date_text = schedule_date.strftime("%Y-%m-%d") if hasattr(schedule_date, "strftime") else str(schedule_date)
+    revisions = [
+        r for r in load_all_schedule_records()
+        if str(r.get("schedule_date", "")) == date_text
+        and str(r.get("shift_name", "")).strip() == str(shift_name).strip()
+        and str(r.get("power_unit", "")).strip() == str(power_unit).strip()
+    ]
+    revisions.sort(key=_revision_number, reverse=True)
+    return revisions
+
+
+def restore_schedule_revision(record, schedule, restored_by):
+    saved_date = datetime.strptime(str(record["schedule_date"]), "%Y-%m-%d").date()
+    earliest_dt = datetime.fromisoformat(str(record["earliest_iso"]))
+    final_dt = datetime.fromisoformat(str(record["final_iso"]))
+    return save_schedule_record(
+        schedule_date=saved_date,
+        shift_name=record["shift_name"],
+        power_unit=record["power_unit"],
+        uploader=restored_by,
+        shift_start=record["shift_start"],
+        shift_end=record["shift_end"],
+        earliest_dt=earliest_dt,
+        final_dt=final_dt,
+        schedule=schedule,
+        peak_concurrent=int(float(record.get("peak_concurrent", 0) or 0)),
+        peak_wb70=int(float(record.get("peak_wb70", 0) or 0)),
+        restored_from_revision=f"v{_revision_number(record)}",
+    )
+
+
+def legacy_db_exists():
+    return Path(LEGACY_DB_PATH).exists()
+
+
+def _deserialize_legacy_schedule(schedule_json):
+    raw = json.loads(schedule_json)
+    schedule = []
+    for item in raw:
+        start_dt = datetime.fromisoformat(item["Start"])
+        finish_dt = datetime.fromisoformat(item["Finish"])
+        name = item.get("Name", "")
+        schedule.append({
+            "Name": name,
+            "Task": f"<b>{name}</b>",
+            "Resource": item["Resource"],
+            "Start": start_dt,
+            "Finish": finish_dt,
+            "Bar_Text": item.get("Bar_Text", ""),
+            "TicketModerator": False,
+        })
+    return schedule
+
+
+def migrate_legacy_sqlite_to_sheets():
+    """One-time, non-destructive importer for schedules saved by V7/V8 SQLite builds."""
+    if not legacy_db_exists():
+        return 0, 0
+    existing_keys = {
+        (str(r.get("schedule_date", "")), str(r.get("shift_name", "")), str(r.get("power_unit", "")))
+        for r in load_all_schedule_records()
+    }
+    migrated = 0
+    skipped = 0
+    conn = sqlite3.connect(LEGACY_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute("SELECT * FROM saved_schedules ORDER BY schedule_date, shift_name, power_unit").fetchall()
+        for row in rows:
+            r = dict(row)
+            key = (r["schedule_date"], r["shift_name"], r["power_unit"])
+            if key in existing_keys:
+                skipped += 1
+                continue
+            schedule = _deserialize_legacy_schedule(r["schedule_json"])
+            save_schedule_record(
+                schedule_date=datetime.strptime(r["schedule_date"], "%Y-%m-%d").date(),
+                shift_name=r["shift_name"],
+                power_unit=r["power_unit"],
+                uploader=r.get("uploader", ""),
+                shift_start=r["shift_start"],
+                shift_end=r["shift_end"],
+                earliest_dt=datetime.fromisoformat(r["earliest_iso"]),
+                final_dt=datetime.fromisoformat(r["final_iso"]),
+                schedule=schedule,
+                peak_concurrent=r.get("peak_concurrent", 0) or 0,
+                peak_wb70=r.get("peak_wb70", 0) or 0,
+                restored_from_revision="Legacy SQLite import",
+                uploaded_at_override=r.get("uploaded_at") or None,
+            )
+            existing_keys.add(key)
+            migrated += 1
+    finally:
+        conn.close()
+    return migrated, skipped
 
 
 def schedule_to_display_df(schedule):
@@ -1131,6 +1428,7 @@ def schedule_to_display_df(schedule):
         rows.append(
             {
                 "Moderator": item.get("Name") or re.sub(r"<[^>]+>", "", item.get("Task", "")),
+                "Ticket Moderator": "Yes" if safe_bool(item.get("TicketModerator", False)) else "",
                 "Break": item["Resource"],
                 "Start": item["Start"].strftime("%H:%M"),
                 "End": item["Finish"].strftime("%H:%M"),
@@ -1140,8 +1438,278 @@ def schedule_to_display_df(schedule):
     return pd.DataFrame(rows)
 
 
+
+def render_generated_schedule(payload):
+    """Render the last generated planner schedule from session state."""
+    schedule_date = payload["schedule_date"]
+    schedule_shift_name = payload["schedule_shift_name"]
+    power_unit = payload["power_unit"]
+    shift_start_str = payload["shift_start_str"]
+    shift_end_str = payload["shift_end_str"]
+    earliest_dt = payload["earliest_dt"]
+    final_dt = payload["final_dt"]
+    schedule = payload["schedule"]
+    sched_df = pd.DataFrame(schedule).sort_values(
+        by=["Task", "Start"], ascending=[False, True]
+    )
+    concurrency_df = payload["concurrency_df"].copy()
+    shift_preset = payload["shift_preset"]
+
+    if payload.get("used_fallback"):
+        st.warning(
+            "⚠️ The mathematical optimizer reached its time/optimality limit, so the app used its "
+            "complete feasible fallback selection rather than incorrectly reporting the schedule as impossible."
+        )
+
+    st.success(
+        f"✅ Current generated schedule ready for review. Peak concurrent breaks: **{payload['peak_concurrent']}**  |  "
+        f"Peak concurrent WB70s: **{payload['peak_wb70']}**"
+    )
+    if payload.get("ticket_moderator_count", 0) >= 2:
+        st.caption(
+            f"🎫 Ticket coverage protected: {payload['ticket_moderator_count']} designated Ticket Moderators; "
+            f"minimum simultaneously on duty during breakable intervals: {payload.get('min_ticket_on_duty', 1)}."
+        )
+
+    wb70_midpoint = payload.get("wb70_shift_midpoint")
+    if payload.get("allow_wb70_second_half", True):
+        st.caption("🧘 WB70 placement: second-half WB70s were allowed for this generated schedule.")
+    elif wb70_midpoint is not None:
+        st.caption(
+            f"🧘 WB70 placement: non-fixed WB70s were required to finish by the shift midpoint "
+            f"({wb70_midpoint.strftime('%H:%M')}). Fixed WB70 Start values override this rule."
+        )
+
+    if shift_preset in ("Morning", "Mid"):
+        st.caption(
+            "Pressure-aware optimization active: 15:00–16:30 Morning/Mid overlap is preferred for concurrency because two shifts are covering the queue."
+        )
+    elif shift_preset == "Night":
+        st.caption(
+            "Night volume is treated as uniform across the shift, so the optimizer does not favor or avoid any Night hour based on volume. It still minimizes WB70 overlap, peak concurrency, and overall clustering."
+        )
+    else:
+        st.caption(
+            "Custom preset uses uniform pressure weighting; optimization still minimizes WB70 overlap and overall concurrency."
+        )
+
+    # ==========================================
+    # CURRENT GENERATED SCHEDULE VISUALS
+    # ==========================================
+    st.markdown(
+        f"<div style='background-color: #1c2838; color: white; padding: 12px; border-radius: 4px; "
+        f"text-align: center; font-size: 22px; font-weight: bold; font-family: Montserrat, sans-serif;'>"
+        f"Shift Break Timetable &bull; {schedule_date.strftime('%Y-%m-%d')} &bull; {schedule_shift_name} &bull; {power_unit} &bull; {shift_start_str}-{shift_end_str}</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    fig_gantt, dynamic_height = create_timetable_figure(
+        sched_df,
+        schedule_date,
+        schedule_shift_name,
+        power_unit,
+        shift_start_str,
+        shift_end_str,
+    )
+    timetable_filename = build_export_filename(
+        "Timetable", schedule_date, schedule_shift_name, power_unit
+    )
+
+    plotly_config = {
+        "toImageButtonOptions": {
+            "format": "png",
+            "filename": timetable_filename.rsplit(".", 1)[0],
+            "height": dynamic_height,
+            "width": 1800,
+            "scale": 3,
+        },
+        "displayModeBar": True,
+    }
+
+    st.plotly_chart(fig_gantt, use_container_width=True, config=plotly_config)
+
+    try:
+        img_bytes = fig_gantt.to_image(
+            format="png", width=1800, height=dynamic_height, scale=3
+        )
+        st.download_button(
+            label="📥 Download High-Resolution Timetable (PNG)",
+            data=img_bytes,
+            file_name=timetable_filename,
+            mime="image/png",
+            key="current_generated_timetable_download",
+        )
+    except Exception:
+        st.info(
+            "💡 To enable the 1-click PNG button, ensure kaleido is installed. "
+            "The Plotly toolbar export still remains available."
+        )
+
+    st.markdown(
+        "<div style='background-color: #1c2838; color: white; padding: 8px; border-radius: 4px; "
+        "text-align: center; font-size: 18px; font-weight: bold; font-family: Montserrat, sans-serif;'>"
+        "Concurrent Breaks Over Time</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    fig_concurrency = px.area(
+        concurrency_df,
+        x="Time",
+        y="Concurrent Breaks",
+        color_discrete_sequence=["#3b82f6"],
+    )
+    fig_concurrency.update_traces(line_shape="hv", fill="tozeroy", opacity=0.3)
+    fig_concurrency.update_layout(
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        font=dict(family="Montserrat, sans-serif", color="black", size=12),
+        xaxis=dict(
+            showgrid=True,
+            gridcolor="#e5e5e5",
+            tickformat="%H:%M",
+            dtick=3600000,
+            title="<b>Time</b>",
+        ),
+        yaxis=dict(
+            showgrid=True,
+            gridcolor="#f3f4f6",
+            title="<b>Staff on Break</b>",
+            tickfont=dict(color="#1c2838", size=12, family="Montserrat, sans-serif"),
+            dtick=1,
+        ),
+        margin=dict(l=0, r=0, t=20, b=40),
+        height=300,
+    )
+    st.plotly_chart(fig_concurrency, use_container_width=True)
+
+    # --- Concurrent Break Heatmap ---
+    st.markdown(
+        "<div style='background-color: #1c2838; color: white; padding: 8px; border-radius: 4px; "
+        "text-align: center; font-size: 18px; font-weight: bold; font-family: Montserrat, sans-serif;'>"
+        "Concurrent Break Heatmap</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.caption(
+        "Management view: each cell shows how many moderators are simultaneously on break "
+        "at that 5-minute point. Lighter pink indicates lower concurrency; deeper violet "
+        "indicates higher concurrency. Cells outside the allowed break window are blank."
+    )
+
+    fig_heatmap, heatmap_height = create_break_overlap_heatmap(
+        schedule,
+        earliest_dt,
+        final_dt,
+        schedule_date=schedule_date,
+        shift_name=schedule_shift_name,
+        power_unit=power_unit,
+    )
+
+    if fig_heatmap is not None:
+        heatmap_filename = build_export_filename(
+            "Break_Overlap_Heatmap", schedule_date, schedule_shift_name, power_unit
+        )
+        heatmap_config = {
+            "toImageButtonOptions": {
+                "format": "png",
+                "filename": heatmap_filename.rsplit(".", 1)[0],
+                "height": heatmap_height,
+                "width": 1800,
+                "scale": 3,
+            },
+            "displayModeBar": True,
+        }
+        st.plotly_chart(
+            fig_heatmap, use_container_width=True, config=heatmap_config
+        )
+
+        try:
+            heatmap_img_bytes = fig_heatmap.to_image(
+                format="png",
+                width=1800,
+                height=heatmap_height,
+                scale=3,
+            )
+            st.download_button(
+                label="📥 Download High-Resolution Break Heatmap (PNG)",
+                data=heatmap_img_bytes,
+                file_name=heatmap_filename,
+                mime="image/png",
+                key="current_generated_heatmap_download",
+            )
+        except Exception:
+            st.info(
+                "💡 To enable the 1-click heatmap PNG button, ensure kaleido is installed. "
+                "The Plotly toolbar export still remains available."
+            )
+    else:
+        st.info("No valid break-window cells were available for the heatmap.")
+
+    st.markdown(
+        "<div style='background-color: #1c2838; color: white; padding: 8px; border-radius: 4px; "
+        "text-align: center; font-size: 18px; font-weight: bold; font-family: Montserrat, sans-serif;'>"
+        "Optimization Pressure Profile</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    pressure_display_df = concurrency_df.copy()
+    pressure_display_df["Relative Pressure"] = pressure_display_df["Pressure Weight"]
+
+    if shift_preset == "Night":
+        pressure_hover = {
+            "Pressure Source": True,
+            "Relative Pressure": ":.3f",
+            "Raw Volume": False,
+            "Effective Pressure": False,
+        }
+    else:
+        pressure_hover = {
+            "Raw Volume": ":.0f",
+            "Effective Pressure": ":.0f",
+            "Pressure Source": True,
+            "Relative Pressure": ":.3f",
+        }
+
+    fig_pressure = px.line(
+        pressure_display_df,
+        x="Time",
+        y="Relative Pressure",
+        hover_data=pressure_hover,
+    )
+    fig_pressure.update_layout(
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        font=dict(family="Montserrat, sans-serif", color="black", size=12),
+        xaxis=dict(
+            showgrid=True,
+            gridcolor="#e5e5e5",
+            tickformat="%H:%M",
+            dtick=3600000,
+            title="<b>Time</b>",
+        ),
+        yaxis=dict(
+            showgrid=True,
+            gridcolor="#f3f4f6",
+            title="<b>Relative Queue Pressure</b>",
+            rangemode="tozero",
+        ),
+        margin=dict(l=0, r=0, t=20, b=40),
+        height=280,
+        showlegend=False,
+    )
+    st.plotly_chart(fig_pressure, use_container_width=True)
+
 def render_schedule_calendar():
-    init_schedule_db()
+    try:
+        get_storage_worksheets()
+    except Exception as exc:
+        st.error(f"Google Sheets storage is not connected: {exc}")
+        st.info("Open the Storage & Setup page for the free Google Sheets setup instructions.")
+        return
+
     today = datetime.now(TURKEY_TZ).date()
     if "calendar_selected_date" not in st.session_state:
         st.session_state.calendar_selected_date = today
@@ -1152,13 +1720,9 @@ def render_schedule_calendar():
     nav_left, nav_title, nav_right = st.columns([1, 5, 1])
     if nav_left.button("← Previous", use_container_width=True):
         if month_date.month == 1:
-            st.session_state.calendar_month = month_date.replace(
-                year=month_date.year - 1, month=12, day=1
-            )
+            st.session_state.calendar_month = month_date.replace(year=month_date.year - 1, month=12, day=1)
         else:
-            st.session_state.calendar_month = month_date.replace(
-                month=month_date.month - 1, day=1
-            )
+            st.session_state.calendar_month = month_date.replace(month=month_date.month - 1, day=1)
         st.rerun()
     nav_title.markdown(
         f"<h3 style='text-align:center; margin-top:4px'>{month_date.strftime('%B %Y')}</h3>",
@@ -1166,13 +1730,9 @@ def render_schedule_calendar():
     )
     if nav_right.button("Next →", use_container_width=True):
         if month_date.month == 12:
-            st.session_state.calendar_month = month_date.replace(
-                year=month_date.year + 1, month=1, day=1
-            )
+            st.session_state.calendar_month = month_date.replace(year=month_date.year + 1, month=1, day=1)
         else:
-            st.session_state.calendar_month = month_date.replace(
-                month=month_date.month + 1, day=1
-            )
+            st.session_state.calendar_month = month_date.replace(month=month_date.month + 1, day=1)
         st.rerun()
 
     counts = load_schedule_counts_for_month(month_date.year, month_date.month)
@@ -1181,7 +1741,7 @@ def render_schedule_calendar():
         weekday_cols[idx].markdown(f"**{weekday}**")
 
     selected_date = st.session_state.calendar_selected_date
-    for week_idx, week in enumerate(pycalendar.monthcalendar(month_date.year, month_date.month)):
+    for week in pycalendar.monthcalendar(month_date.year, month_date.month):
         day_cols = st.columns(7)
         for day_idx, day_num in enumerate(week):
             if day_num == 0:
@@ -1190,164 +1750,205 @@ def render_schedule_calendar():
             day_date = month_date.replace(day=day_num)
             count = counts.get(day_date.strftime("%Y-%m-%d"), 0)
             label = f"{day_num}" if count == 0 else f"{day_num} · {count}"
-            is_selected = day_date == selected_date
             if day_cols[day_idx].button(
                 label,
                 key=f"calendar_day_{month_date.year}_{month_date.month}_{day_num}",
-                type="primary" if is_selected else "secondary",
+                type="primary" if day_date == selected_date else "secondary",
                 use_container_width=True,
-                help=(f"{count} saved schedule(s)" if count else "No saved schedules"),
+                help=(f"{count} current schedule(s)" if count else "No saved schedules"),
             ):
                 st.session_state.calendar_selected_date = day_date
                 selected_date = day_date
 
     st.markdown(f"### Selected date: {selected_date.strftime('%Y-%m-%d')}")
     records = load_schedules_for_date(selected_date)
-
     st.caption(
-        "The app keeps one current saved schedule for each Date + Shift + Power Unit. "
-        "Generating and saving a new version for the same combination replaces the previous version and updates the upload timestamp."
+        "Calendar shows the current revision for each Date + Shift + Power Unit. Every previous save is retained in Revision History."
     )
 
     if not records:
         st.info(f"No saved break schedules for {selected_date.strftime('%Y-%m-%d')}.")
         return
 
-    summary_df = pd.DataFrame(
-        [
-            {
-                "Shift": r["shift_name"],
-                "Power Unit": r["power_unit"],
-                "Uploaded By": r["uploader"] or "—",
-                "Last Uploaded": datetime.fromisoformat(r["uploaded_at"]).strftime("%Y-%m-%d %H:%M"),
-                "Peak Breaks": r["peak_concurrent"],
-                "Peak WB70": r["peak_wb70"],
-            }
-            for r in records
-        ]
-    )
+    break_map = load_break_rows_for_schedule_ids([r["schedule_id"] for r in records])
+    summary_df = pd.DataFrame([
+        {
+            "Shift": r["shift_name"],
+            "Power Unit": r["power_unit"],
+            "Revision": f"v{_revision_number(r)}",
+            "Uploaded By": r.get("uploader") or "—",
+            "Last Uploaded": datetime.fromisoformat(str(r["uploaded_at"])).strftime("%Y-%m-%d %H:%M"),
+            "Ticket Mods": int(float(r.get("ticket_moderator_count", 0) or 0)),
+            "Peak Breaks": int(float(r.get("peak_concurrent", 0) or 0)),
+            "Peak WB70": int(float(r.get("peak_wb70", 0) or 0)),
+        }
+        for r in records
+    ])
     st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
     for rec_idx, record in enumerate(records):
-        label = f"{record['shift_name']} • {record['power_unit']}"
+        label = f"{record['shift_name']} • {record['power_unit']} • v{_revision_number(record)}"
         with st.expander(label, expanded=(len(records) == 1)):
-            uploaded_display = datetime.fromisoformat(record["uploaded_at"]).strftime("%Y-%m-%d %H:%M:%S")
+            uploaded_display = datetime.fromisoformat(str(record["uploaded_at"])).strftime("%Y-%m-%d %H:%M:%S")
+            restored_note = f" · **Restored from:** {record.get('restored_from_revision')}" if record.get("restored_from_revision") else ""
             st.markdown(
-                f"**Date:** {record['schedule_date']}  ·  "
-                f"**Shift:** {record['shift_name']}  ·  "
-                f"**Power Unit:** {record['power_unit']}  ·  "
-                f"**Uploaded by:** {record['uploader'] or '—'}  ·  "
-                f"**Last uploaded:** {uploaded_display} (Türkiye time)"
+                f"**Date:** {record['schedule_date']}  ·  **Shift:** {record['shift_name']}  ·  "
+                f"**Power Unit:** {record['power_unit']}  ·  **Current revision:** v{_revision_number(record)}  ·  "
+                f"**Uploaded by:** {record.get('uploader') or '—'}  ·  **Last uploaded:** {uploaded_display} (Türkiye time)"
+                f"{restored_note}"
             )
 
-            schedule = deserialize_schedule(record["schedule_json"])
-            sched_df = pd.DataFrame(schedule).sort_values(
-                by=["Task", "Start"], ascending=[False, True]
-            )
-            saved_date = datetime.strptime(record["schedule_date"], "%Y-%m-%d").date()
+            schedule = schedule_from_break_rows(break_map.get(str(record["schedule_id"]), []))
+            if not schedule:
+                st.warning("No break rows were found for this saved revision.")
+                continue
+            sched_df = pd.DataFrame(schedule).sort_values(by=["Task", "Start"], ascending=[False, True])
+            saved_date = datetime.strptime(str(record["schedule_date"]), "%Y-%m-%d").date()
 
             fig_gantt, dynamic_height = create_timetable_figure(
-                sched_df,
-                saved_date,
-                record["shift_name"],
-                record["power_unit"],
-                record["shift_start"],
-                record["shift_end"],
+                sched_df, saved_date, record["shift_name"], record["power_unit"], record["shift_start"], record["shift_end"]
             )
-            timetable_filename = build_export_filename(
-                "Timetable", saved_date, record["shift_name"], record["power_unit"]
-            )
+            timetable_filename = build_export_filename("Timetable", saved_date, record["shift_name"], record["power_unit"])
             st.plotly_chart(
-                fig_gantt,
-                use_container_width=True,
-                key=f"saved_gantt_{record['id']}_{rec_idx}",
-                config={
-                    "toImageButtonOptions": {
-                        "format": "png",
-                        "filename": timetable_filename.rsplit(".", 1)[0],
-                        "height": dynamic_height,
-                        "width": 1800,
-                        "scale": 3,
-                    },
-                    "displayModeBar": True,
-                },
+                fig_gantt, use_container_width=True, key=f"saved_gantt_{record['schedule_id']}_{rec_idx}",
+                config={"toImageButtonOptions": {"format": "png", "filename": timetable_filename.rsplit(".", 1)[0], "height": dynamic_height, "width": 1800, "scale": 3}, "displayModeBar": True},
             )
             try:
-                timetable_bytes = fig_gantt.to_image(
-                    format="png", width=1800, height=dynamic_height, scale=3
-                )
-                st.download_button(
-                    "📥 Download Timetable PNG",
-                    timetable_bytes,
-                    file_name=timetable_filename,
-                    mime="image/png",
-                    key=f"saved_gantt_download_{record['id']}",
-                )
+                timetable_bytes = fig_gantt.to_image(format="png", width=1800, height=dynamic_height, scale=3)
+                st.download_button("📥 Download Timetable PNG", timetable_bytes, file_name=timetable_filename, mime="image/png", key=f"saved_gantt_download_{record['schedule_id']}")
             except Exception:
                 st.caption("Install kaleido to enable the one-click PNG download button.")
 
             with st.expander("View break list"):
-                st.dataframe(
-                    schedule_to_display_df(schedule),
-                    use_container_width=True,
-                    hide_index=True,
-                )
+                st.dataframe(schedule_to_display_df(schedule), use_container_width=True, hide_index=True)
 
-            earliest_dt = datetime.fromisoformat(record["earliest_iso"])
-            final_dt = datetime.fromisoformat(record["final_iso"])
+            earliest_dt = datetime.fromisoformat(str(record["earliest_iso"]))
+            final_dt = datetime.fromisoformat(str(record["final_iso"]))
             fig_heatmap, heatmap_height = create_break_overlap_heatmap(
-                schedule,
-                earliest_dt,
-                final_dt,
-                schedule_date=saved_date,
-                shift_name=record["shift_name"],
-                power_unit=record["power_unit"],
+                schedule, earliest_dt, final_dt, schedule_date=saved_date, shift_name=record["shift_name"], power_unit=record["power_unit"]
             )
             if fig_heatmap is not None:
-                heatmap_filename = build_export_filename(
-                    "Break_Overlap_Heatmap",
-                    saved_date,
-                    record["shift_name"],
-                    record["power_unit"],
-                )
+                heatmap_filename = build_export_filename("Break_Overlap_Heatmap", saved_date, record["shift_name"], record["power_unit"])
                 st.plotly_chart(
-                    fig_heatmap,
-                    use_container_width=True,
-                    key=f"saved_heatmap_{record['id']}_{rec_idx}",
-                    config={
-                        "toImageButtonOptions": {
-                            "format": "png",
-                            "filename": heatmap_filename.rsplit(".", 1)[0],
-                            "height": heatmap_height,
-                            "width": 1800,
-                            "scale": 3,
-                        },
-                        "displayModeBar": True,
-                    },
+                    fig_heatmap, use_container_width=True, key=f"saved_heatmap_{record['schedule_id']}_{rec_idx}",
+                    config={"toImageButtonOptions": {"format": "png", "filename": heatmap_filename.rsplit(".", 1)[0], "height": heatmap_height, "width": 1800, "scale": 3}, "displayModeBar": True},
                 )
                 try:
-                    heatmap_bytes = fig_heatmap.to_image(
-                        format="png", width=1800, height=heatmap_height, scale=3
-                    )
-                    st.download_button(
-                        "📥 Download Heatmap PNG",
-                        heatmap_bytes,
-                        file_name=heatmap_filename,
-                        mime="image/png",
-                        key=f"saved_heatmap_download_{record['id']}",
-                    )
+                    heatmap_bytes = fig_heatmap.to_image(format="png", width=1800, height=heatmap_height, scale=3)
+                    st.download_button("📥 Download Heatmap PNG", heatmap_bytes, file_name=heatmap_filename, mime="image/png", key=f"saved_heatmap_download_{record['schedule_id']}")
                 except Exception:
                     pass
 
+            with st.expander("Revision History"):
+                revisions = load_schedule_revisions(saved_date, record["shift_name"], record["power_unit"])
+                history_df = pd.DataFrame([
+                    {
+                        "Revision": f"v{_revision_number(r)}",
+                        "Current": "Yes" if safe_bool(r.get("is_current", False)) else "",
+                        "Uploaded By": r.get("uploader") or "—",
+                        "Uploaded At": datetime.fromisoformat(str(r["uploaded_at"])).strftime("%Y-%m-%d %H:%M:%S"),
+                        "Restored From": r.get("restored_from_revision") or "",
+                    }
+                    for r in revisions
+                ])
+                st.dataframe(history_df, use_container_width=True, hide_index=True)
+
+                revision_options = {_revision_number(r): r for r in revisions}
+                selected_revision_num = st.selectbox(
+                    "Revision to preview / restore",
+                    options=sorted(revision_options.keys(), reverse=True),
+                    format_func=lambda x: f"v{x}" + (" — current" if safe_bool(revision_options[x].get("is_current", False)) else ""),
+                    key=f"revision_select_{record['schedule_id']}",
+                )
+                selected_revision = revision_options[selected_revision_num]
+                selected_break_map = load_break_rows_for_schedule_ids([selected_revision["schedule_id"]])
+                selected_schedule = schedule_from_break_rows(selected_break_map.get(str(selected_revision["schedule_id"]), []))
+                if selected_schedule:
+                    st.dataframe(schedule_to_display_df(selected_schedule), use_container_width=True, hide_index=True)
+
+                restore_col1, restore_col2 = st.columns([2, 1])
+                restore_by = restore_col1.text_input(
+                    "Restored by",
+                    placeholder="Name or initials",
+                    key=f"restore_by_{record['schedule_id']}",
+                ).strip()
+                restore_clicked = restore_col2.button(
+                    f"♻️ Restore v{selected_revision_num}",
+                    disabled=safe_bool(selected_revision.get("is_current", False)) or not bool(selected_schedule),
+                    use_container_width=True,
+                    key=f"restore_btn_{record['schedule_id']}_{selected_revision_num}",
+                )
+                if restore_clicked:
+                    if not restore_by:
+                        st.error("Enter a name or initials in 'Restored by' before restoring a revision.")
+                    else:
+                        uploaded_at, new_revision, _ = restore_schedule_revision(selected_revision, selected_schedule, restore_by)
+                        st.success(f"Restored v{selected_revision_num} as new current revision v{new_revision} at {uploaded_at}.")
+                        st.rerun()
+
     with st.expander("Storage note"):
         st.caption(
-            f"Schedules are stored in SQLite at: {DB_PATH}. For a cloud deployment with ephemeral local storage, "
-            "set BREAK_PLANNER_DB_PATH to a path on a persistent shared volume so schedules survive redeployments/restarts."
+            "Schedules are stored in a private Google Sheet. Streamlit only holds the generated schedule in session while it is being reviewed; "
+            "published Calendar revisions remain in Google Sheets across Streamlit restarts and redeployments."
         )
+
+
+def render_storage_setup():
+    st.subheader("Google Sheets connection")
+    try:
+        status = storage_connection_status()
+        st.success(f"✅ Connected to private Google Sheet: {status['title']}")
+        st.caption("The app will automatically create/use the Schedules and Breaks tabs. Every save is append-only and previous revisions are retained.")
+        st.link_button("Open storage spreadsheet", f"https://docs.google.com/spreadsheets/d/{status['spreadsheet_id']}")
+    except Exception as exc:
+        st.error(f"Not connected yet: {exc}")
+
+    st.markdown("### Free setup")
+    st.markdown(
+        "1. Create a private Google Sheet.  \n"
+        "2. In Google Cloud, enable the Google Sheets API and create a Service Account + JSON key.  \n"
+        "3. Share the private Sheet with the service account email as **Editor**.  \n"
+        "4. Copy the spreadsheet ID from the Sheet URL.  \n"
+        "5. In Streamlit Community Cloud, open **App → Settings → Secrets** and paste the configuration below, replacing the placeholders with values from the JSON key.  \n"
+        "6. Never commit the real secrets file or JSON key to GitHub."
+    )
+    secrets_example = (
+        '[break_planner]\n'
+        'spreadsheet_id = "YOUR_SPREADSHEET_ID"\n\n'
+        '[gcp_service_account]\n'
+        'type = "service_account"\n'
+        'project_id = "YOUR_PROJECT_ID"\n'
+        'private_key_id = "YOUR_PRIVATE_KEY_ID"\n'
+        'private_key = "\"\"-----BEGIN PRIVATE KEY-----\nYOUR_PRIVATE_KEY\n-----END PRIVATE KEY-----\n\"\""\n'
+        'client_email = "YOUR_SERVICE_ACCOUNT@YOUR_PROJECT.iam.gserviceaccount.com"\n'
+        'client_id = "YOUR_CLIENT_ID"\n'
+        'auth_uri = "https://accounts.google.com/o/oauth2/auth"\n'
+        'token_uri = "https://oauth2.googleapis.com/token"\n'
+        'auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"\n'
+        'client_x509_cert_url = "YOUR_CLIENT_X509_CERT_URL"'
+    )
+    st.code(secrets_example, language="toml")
+
+    st.markdown("### Legacy SQLite migration")
+    if legacy_db_exists():
+        st.info(f"Legacy SQLite database detected at {LEGACY_DB_PATH}. The importer skips Date + Shift + PU combinations already present in Google Sheets.")
+        if st.button("Import legacy SQLite schedules into Google Sheets", type="primary"):
+            try:
+                migrated, skipped = migrate_legacy_sqlite_to_sheets()
+                st.success(f"Migration complete: {migrated} imported, {skipped} skipped because they already existed.")
+            except Exception as exc:
+                st.error(f"Migration failed: {exc}")
+    else:
+        st.caption("No legacy break_schedules.db file is present in this deployment. Nothing needs to be migrated here.")
+
 
 
 if page == "Schedule Calendar":
     render_schedule_calendar()
+    st.stop()
+
+if page == "Storage & Setup":
+    render_storage_setup()
     st.stop()
 
 
@@ -1387,7 +1988,8 @@ with detail_col4:
 
 st.caption(
     "Date, Shift and Power Unit are embedded into timetable/heatmap exports and their filenames. "
-    "Use Generate & Save to Calendar to publish the current schedule for management/operations."
+    "You can either generate and publish immediately, or generate first, review the full schedule, then use "
+    "Save Current Generated Schedule to Calendar."
 )
 
 st.subheader("Moderator List & Entitlements")
@@ -1395,25 +1997,28 @@ st.caption(
     "Break order is otherwise arbitrary, but Meal can never be the first break. "
     "Meal Exception is automatic: if WB70s > 0, that moderator's Meal is not restricted to the normal Meal Window. "
     "WB70 Duration (mins) is optional: leave it blank to use the universal WB70 duration from the sidebar, "
-    "or enter a moderator-specific duration such as 40, 50 or 60 minutes."
+    "or enter a moderator-specific duration such as 40, 50 or 60 minutes. "
+    "Use the WB70 Placement toggle in the sidebar to allow or prevent non-fixed WB70s from entering the second half of the shift; "
+    "Fixed WB70 Start always overrides that toggle. "
+    "Tick Ticket Moderator for moderators who must maintain ticket coverage; the optimizer will never place all designated ticket moderators on break at the same time."
 )
 
 default_data = [
-    {"Name": "Alper Uçar", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": ""},
-    {"Name": "Arda Su Topcu", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": ""},
-    {"Name": "Asiye Sağir", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": ""},
-    {"Name": "Baki Doğan", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": ""},
-    {"Name": "Çağtay Kaplan", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": ""},
-    {"Name": "Damla Özçelik", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": ""},
-    {"Name": "Ege Saritaş", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": ""},
-    {"Name": "Ege Solaker", "Shorts": 3, "Meals": 1, "WB20s": 0, "WB70s": 1, "WB70 Duration (mins)": None, "Fixed WB70 Start": ""},
-    {"Name": "Gökay Deniz Akçayöz", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": ""},
-    {"Name": "Gülsena Kaya", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": ""},
-    {"Name": "Hilay Özgü Öztürk", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": ""},
-    {"Name": "İrem Kındıra", "Shorts": 3, "Meals": 1, "WB20s": 0, "WB70s": 1, "WB70 Duration (mins)": None, "Fixed WB70 Start": ""},
-    {"Name": "Kadirhan Tekin", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": ""},
-    {"Name": "Saim Varol", "Shorts": 3, "Meals": 1, "WB20s": 0, "WB70s": 1, "WB70 Duration (mins)": None, "Fixed WB70 Start": ""},
-    {"Name": "Zeynep Öykü Ercan", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": ""},
+    {"Name": "Alper Uçar", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": "", "Ticket Moderator": False},
+    {"Name": "Arda Su Topcu", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": "", "Ticket Moderator": False},
+    {"Name": "Asiye Sağir", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": "", "Ticket Moderator": False},
+    {"Name": "Baki Doğan", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": "", "Ticket Moderator": False},
+    {"Name": "Çağtay Kaplan", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": "", "Ticket Moderator": False},
+    {"Name": "Damla Özçelik", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": "", "Ticket Moderator": False},
+    {"Name": "Ege Saritaş", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": "", "Ticket Moderator": False},
+    {"Name": "Ege Solaker", "Shorts": 3, "Meals": 1, "WB20s": 0, "WB70s": 1, "WB70 Duration (mins)": None, "Fixed WB70 Start": "", "Ticket Moderator": False},
+    {"Name": "Gökay Deniz Akçayöz", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": "", "Ticket Moderator": False},
+    {"Name": "Gülsena Kaya", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": "", "Ticket Moderator": False},
+    {"Name": "Hilay Özgü Öztürk", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": "", "Ticket Moderator": False},
+    {"Name": "İrem Kındıra", "Shorts": 3, "Meals": 1, "WB20s": 0, "WB70s": 1, "WB70 Duration (mins)": None, "Fixed WB70 Start": "", "Ticket Moderator": False},
+    {"Name": "Kadirhan Tekin", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": "", "Ticket Moderator": False},
+    {"Name": "Saim Varol", "Shorts": 3, "Meals": 1, "WB20s": 0, "WB70s": 1, "WB70 Duration (mins)": None, "Fixed WB70 Start": "", "Ticket Moderator": False},
+    {"Name": "Zeynep Öykü Ercan", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": "", "Ticket Moderator": False},
 ]
 
 edited_df = st.data_editor(
@@ -1421,6 +2026,11 @@ edited_df = st.data_editor(
     num_rows="dynamic",
     use_container_width=True,
     column_config={
+        "Ticket Moderator": st.column_config.CheckboxColumn(
+            "Ticket Moderator",
+            help="Designated ticket moderators are protected so at least one remains on duty at every 5-minute interval.",
+            default=False,
+        ),
         "WB70 Duration (mins)": st.column_config.NumberColumn(
             "WB70 Duration (mins)",
             help=(
@@ -1577,10 +2187,13 @@ if generate_clicked or generate_save_clicked:
                     )
                     st.stop()
 
+                ticket_moderator = safe_bool(row.get("Ticket Moderator", False))
+
                 profile = (
                     tuple((b, counts[b]) for b in BREAK_TYPES),
                     tuple((b, effective_durations[b]) for b in BREAK_TYPES),
                     fixed_mins,
+                    bool(allow_wb70_second_half),
                 )
 
                 if profile not in profile_cache:
@@ -1595,6 +2208,7 @@ if generate_clicked or generate_save_clicked:
                         min_inside=min_gap,
                         max_inside=max_gap,
                         fixed_wb70_mins=fixed_mins,
+                        allow_wb70_second_half=allow_wb70_second_half,
                     )
                     profile_cache[profile] = patterns
 
@@ -1605,6 +2219,9 @@ if generate_clicked or generate_save_clicked:
                         extra += f" Fixed WB70 start: {row.get('Fixed WB70 Start', '')}."
                     if counts["WB70"] > 0:
                         extra += f" WB70 duration: {effective_durations['WB70']} minutes."
+                        if not allow_wb70_second_half and fixed_mins is None:
+                            midpoint_dt = shift_start_dt + timedelta(minutes=total_shift_mins / 2.0)
+                            extra += f" Non-fixed WB70 must finish by shift midpoint ({midpoint_dt.strftime('%H:%M')})."
                     st.error(
                         f"❌ No individually feasible break layout exists for {name} under the current rules.{extra} "
                         "This is a genuine moderator-level rule conflict, not a solver timeout."
@@ -1618,12 +2235,22 @@ if generate_clicked or generate_save_clicked:
                         "Durations": effective_durations,
                         "WB70DurationOverride": wb70_duration_override,
                         "FixedWB70": fixed_mins,
+                        "TicketModerator": ticket_moderator,
                         "Profile": profile,
                     }
                 )
 
             if not moderators:
                 st.error("❌ No moderators with break entitlements were provided.")
+                st.stop()
+
+            ticket_moderators = [m for m in moderators if m.get("TicketModerator", False)]
+            if len(ticket_moderators) == 1:
+                st.error(
+                    f"❌ Only one Ticket Moderator is selected ({ticket_moderators[0]['Name']}). "
+                    "The rule requires at least one ticket moderator to remain on duty, so a single designated moderator could never take a break. "
+                    "Select at least two Ticket Moderators or clear the checkbox."
+                )
                 st.stop()
 
             timeline_mins = list(range(0, total_shift_mins + 1, TIME_STEP))
@@ -1682,12 +2309,30 @@ if generate_clicked or generate_save_clicked:
                             "Start": start_dt,
                             "Finish": end_dt,
                             "Bar_Text": bar_text,
+                            "TicketModerator": bool(mod.get("TicketModerator", False)),
                         }
                     )
 
             if not schedule:
                 st.error("❌ No schedule could be constructed.")
                 st.stop()
+
+            ticket_count = len(ticket_moderators)
+            min_ticket_on_duty = None
+            if ticket_count >= 2:
+                ticket_names = {m["Name"] for m in ticket_moderators}
+                ticket_break_counts = []
+                for t in range(0, total_shift_mins + 1, TIME_STEP):
+                    t_dt = shift_start_dt + timedelta(minutes=t)
+                    count_on_break = sum(
+                        1 for b in schedule
+                        if b.get("Name") in ticket_names and b["Start"] <= t_dt < b["Finish"]
+                    )
+                    ticket_break_counts.append(count_on_break)
+                min_ticket_on_duty = ticket_count - max(ticket_break_counts, default=0)
+                if min_ticket_on_duty < 1:
+                    st.error("❌ Internal validation failed: all Ticket Moderators overlap on break at least once.")
+                    st.stop()
 
             sched_df = pd.DataFrame(schedule).sort_values(
                 by=["Task", "Start"], ascending=[False, True]
@@ -1709,19 +2354,31 @@ if generate_clicked or generate_save_clicked:
                 }
             )
 
-            if result["UsedFallback"]:
-                st.warning(
-                    "⚠️ The mathematical optimizer reached its time/optimality limit, so the app used its "
-                    "complete feasible fallback selection rather than incorrectly reporting the schedule as impossible."
-                )
-
-            st.success(
-                f"✅ Schedule Generated! Peak concurrent breaks: **{result['Peak']}**  |  "
-                f"Peak concurrent WB70s: **{result['WB70Peak']}**"
-            )
+            current_payload = {
+                "schedule_date": schedule_date,
+                "schedule_shift_name": schedule_shift_name,
+                "power_unit": power_unit,
+                "uploader": uploader_name,
+                "shift_start_str": shift_start_str,
+                "shift_end_str": shift_end_str,
+                "earliest_dt": earliest_dt,
+                "final_dt": final_dt,
+                "schedule": schedule,
+                "peak_concurrent": int(result["Peak"]),
+                "peak_wb70": int(result["WB70Peak"]),
+                "ticket_moderator_count": ticket_count,
+                "min_ticket_on_duty": min_ticket_on_duty,
+                "allow_wb70_second_half": bool(allow_wb70_second_half),
+                "wb70_shift_midpoint": shift_start_dt + timedelta(minutes=total_shift_mins / 2.0),
+                "used_fallback": bool(result["UsedFallback"]),
+                "concurrency_df": concurrency_df,
+                "shift_preset": shift_preset,
+                "generated_at": datetime.now(TURKEY_TZ).isoformat(timespec="seconds"),
+            }
+            st.session_state["current_generated_schedule"] = current_payload
 
             if generate_save_clicked:
-                uploaded_at, replaced_existing = save_schedule_record(
+                uploaded_at, new_revision, had_previous = save_schedule_record(
                     schedule_date=schedule_date,
                     shift_name=schedule_shift_name,
                     power_unit=power_unit,
@@ -1734,234 +2391,76 @@ if generate_clicked or generate_save_clicked:
                     peak_concurrent=result["Peak"],
                     peak_wb70=result["WB70Peak"],
                 )
-                action_text = "updated" if replaced_existing else "saved"
                 uploaded_display = datetime.fromisoformat(uploaded_at).strftime("%Y-%m-%d %H:%M:%S")
-                st.success(
-                    f"💾 Schedule {action_text} to Calendar for {schedule_date.strftime('%Y-%m-%d')} "
+                st.session_state["current_schedule_save_notice"] = (
+                    f"💾 Schedule saved to Calendar as revision v{new_revision} for {schedule_date.strftime('%Y-%m-%d')} "
                     f"• {schedule_shift_name} • {power_unit}. Upload time: {uploaded_display} (Türkiye time)."
                 )
 
-            if shift_preset in ("Morning", "Mid"):
-                st.caption(
-                    "Pressure-aware optimization active: 15:00–16:30 Morning/Mid overlap is preferred for concurrency because two shifts are covering the queue."
-                )
-            elif shift_preset == "Night":
-                st.caption(
-                    "Night volume is treated as uniform across the shift, so the optimizer does not favor or avoid any Night hour based on volume. It still minimizes WB70 overlap, peak concurrency, and overall clustering."
-                )
-            else:
-                st.caption(
-                    "Custom preset uses uniform pressure weighting; optimization still minimizes WB70 overlap and overall concurrency."
-                )
-
-            # ==========================================
-            # 6. DASHBOARD & VISUALIZATION
-            # ==========================================
-            st.markdown(
-                f"<div style='background-color: #1c2838; color: white; padding: 12px; border-radius: 4px; "
-                f"text-align: center; font-size: 22px; font-weight: bold; font-family: Montserrat, sans-serif;'>"
-                f"Shift Break Timetable &bull; {schedule_date.strftime('%Y-%m-%d')} &bull; {schedule_shift_name} &bull; {power_unit} &bull; {shift_start_str}-{shift_end_str}</div>",
-                unsafe_allow_html=True,
-            )
-            st.markdown("<br>", unsafe_allow_html=True)
-
-            fig_gantt, dynamic_height = create_timetable_figure(
-                sched_df,
-                schedule_date,
-                schedule_shift_name,
-                power_unit,
-                shift_start_str,
-                shift_end_str,
-            )
-            timetable_filename = build_export_filename(
-                "Timetable", schedule_date, schedule_shift_name, power_unit
-            )
-
-            plotly_config = {
-                "toImageButtonOptions": {
-                    "format": "png",
-                    "filename": timetable_filename.rsplit(".", 1)[0],
-                    "height": dynamic_height,
-                    "width": 1800,
-                    "scale": 3,
-                },
-                "displayModeBar": True,
-            }
-
-            st.plotly_chart(fig_gantt, use_container_width=True, config=plotly_config)
-
-            try:
-                img_bytes = fig_gantt.to_image(
-                    format="png", width=1800, height=dynamic_height, scale=3
-                )
-                st.download_button(
-                    label="📥 Download High-Resolution Timetable (PNG)",
-                    data=img_bytes,
-                    file_name=timetable_filename,
-                    mime="image/png",
-                )
-            except Exception:
-                st.info(
-                    "💡 To enable the 1-click PNG button, ensure kaleido is installed. "
-                    "The Plotly toolbar export still remains available."
-                )
-
-            st.markdown(
-                "<div style='background-color: #1c2838; color: white; padding: 8px; border-radius: 4px; "
-                "text-align: center; font-size: 18px; font-weight: bold; font-family: Montserrat, sans-serif;'>"
-                "Concurrent Breaks Over Time</div>",
-                unsafe_allow_html=True,
-            )
-            st.markdown("<br>", unsafe_allow_html=True)
-
-            fig_concurrency = px.area(
-                concurrency_df,
-                x="Time",
-                y="Concurrent Breaks",
-                color_discrete_sequence=["#3b82f6"],
-            )
-            fig_concurrency.update_traces(line_shape="hv", fill="tozeroy", opacity=0.3)
-            fig_concurrency.update_layout(
-                plot_bgcolor="white",
-                paper_bgcolor="white",
-                font=dict(family="Montserrat, sans-serif", color="black", size=12),
-                xaxis=dict(
-                    showgrid=True,
-                    gridcolor="#e5e5e5",
-                    tickformat="%H:%M",
-                    dtick=3600000,
-                    title="<b>Time</b>",
-                ),
-                yaxis=dict(
-                    showgrid=True,
-                    gridcolor="#f3f4f6",
-                    title="<b>Staff on Break</b>",
-                    tickfont=dict(color="#1c2838", size=12, family="Montserrat, sans-serif"),
-                    dtick=1,
-                ),
-                margin=dict(l=0, r=0, t=20, b=40),
-                height=300,
-            )
-            st.plotly_chart(fig_concurrency, use_container_width=True)
-
-            # --- Concurrent Break Heatmap ---
-            st.markdown(
-                "<div style='background-color: #1c2838; color: white; padding: 8px; border-radius: 4px; "
-                "text-align: center; font-size: 18px; font-weight: bold; font-family: Montserrat, sans-serif;'>"
-                "Concurrent Break Heatmap</div>",
-                unsafe_allow_html=True,
-            )
-            st.markdown("<br>", unsafe_allow_html=True)
-            st.caption(
-                "Management view: each cell shows how many moderators are simultaneously on break "
-                "at that 5-minute point. Lighter pink indicates lower concurrency; deeper violet "
-                "indicates higher concurrency. Cells outside the allowed break window are blank."
-            )
-
-            fig_heatmap, heatmap_height = create_break_overlap_heatmap(
-                schedule,
-                earliest_dt,
-                final_dt,
-                schedule_date=schedule_date,
-                shift_name=schedule_shift_name,
-                power_unit=power_unit,
-            )
-
-            if fig_heatmap is not None:
-                heatmap_filename = build_export_filename(
-                    "Break_Overlap_Heatmap", schedule_date, schedule_shift_name, power_unit
-                )
-                heatmap_config = {
-                    "toImageButtonOptions": {
-                        "format": "png",
-                        "filename": heatmap_filename.rsplit(".", 1)[0],
-                        "height": heatmap_height,
-                        "width": 1800,
-                        "scale": 3,
-                    },
-                    "displayModeBar": True,
-                }
-                st.plotly_chart(
-                    fig_heatmap, use_container_width=True, config=heatmap_config
-                )
-
-                try:
-                    heatmap_img_bytes = fig_heatmap.to_image(
-                        format="png",
-                        width=1800,
-                        height=heatmap_height,
-                        scale=3,
-                    )
-                    st.download_button(
-                        label="📥 Download High-Resolution Break Heatmap (PNG)",
-                        data=heatmap_img_bytes,
-                        file_name=heatmap_filename,
-                        mime="image/png",
-                    )
-                except Exception:
-                    st.info(
-                        "💡 To enable the 1-click heatmap PNG button, ensure kaleido is installed. "
-                        "The Plotly toolbar export still remains available."
-                    )
-            else:
-                st.info("No valid break-window cells were available for the heatmap.")
-
-            st.markdown(
-                "<div style='background-color: #1c2838; color: white; padding: 8px; border-radius: 4px; "
-                "text-align: center; font-size: 18px; font-weight: bold; font-family: Montserrat, sans-serif;'>"
-                "Optimization Pressure Profile</div>",
-                unsafe_allow_html=True,
-            )
-            st.markdown("<br>", unsafe_allow_html=True)
-
-            pressure_display_df = concurrency_df.copy()
-            pressure_display_df["Relative Pressure"] = pressure_display_df["Pressure Weight"]
-
-            if shift_preset == "Night":
-                # The actual uniform Night throughput value is intentionally not
-                # required for optimization. Only the fact that it is uniform matters.
-                pressure_hover = {
-                    "Pressure Source": True,
-                    "Relative Pressure": ":.3f",
-                    "Raw Volume": False,
-                    "Effective Pressure": False,
-                }
-            else:
-                pressure_hover = {
-                    "Raw Volume": ":.0f",
-                    "Effective Pressure": ":.0f",
-                    "Pressure Source": True,
-                    "Relative Pressure": ":.3f",
-                }
-
-            fig_pressure = px.line(
-                pressure_display_df,
-                x="Time",
-                y="Relative Pressure",
-                hover_data=pressure_hover,
-            )
-            fig_pressure.update_layout(
-                plot_bgcolor="white",
-                paper_bgcolor="white",
-                font=dict(family="Montserrat, sans-serif", color="black", size=12),
-                xaxis=dict(
-                    showgrid=True,
-                    gridcolor="#e5e5e5",
-                    tickformat="%H:%M",
-                    dtick=3600000,
-                    title="<b>Time</b>",
-                ),
-                yaxis=dict(
-                    showgrid=True,
-                    gridcolor="#f3f4f6",
-                    title="<b>Relative Queue Pressure</b>",
-                    rangemode="tozero",
-                ),
-                margin=dict(l=0, r=0, t=20, b=40),
-                height=280,
-                showlegend=False,
-            )
-            st.plotly_chart(fig_pressure, use_container_width=True)
 
         except Exception as exc:
             st.error(f"An unexpected error occurred during scheduling calculation: {str(exc)}")
+
+
+# ==========================================
+# 7. CURRENT GENERATED SCHEDULE: REVIEW, THEN SAVE
+# ==========================================
+current_payload = st.session_state.get("current_generated_schedule")
+if current_payload:
+    st.markdown("---")
+    st.subheader("Current Generated Schedule")
+    generated_at = datetime.fromisoformat(current_payload["generated_at"])
+    st.caption(
+        f"Generated: {generated_at.strftime('%Y-%m-%d %H:%M:%S')} (Türkiye time) • "
+        f"Date: {current_payload['schedule_date'].strftime('%Y-%m-%d')} • "
+        f"Shift: {current_payload['schedule_shift_name']} • Power Unit: {current_payload['power_unit']}. "
+        "This is a saved-in-session snapshot of the last generated result, so you can review it before publishing it to the Calendar."
+    )
+
+    notice = st.session_state.pop("current_schedule_save_notice", None)
+    if notice:
+        st.success(notice)
+
+    save_col, note_col = st.columns([1.3, 3.7])
+    with save_col:
+        save_current_clicked = st.button(
+            "💾 Save Current Generated Schedule to Calendar",
+            type="primary",
+            use_container_width=True,
+            key="save_current_generated_schedule",
+        )
+    with note_col:
+        st.caption(
+            "Date, Shift and Power Unit are taken from the generated schedule above. "
+            "The current Prepared / Uploaded by field is used as the signature. Saving creates a new immutable revision; it does not erase the previous Calendar version."
+        )
+
+    if save_current_clicked:
+        try:
+            uploaded_at, new_revision, had_previous = save_schedule_record(
+                schedule_date=current_payload["schedule_date"],
+                shift_name=current_payload["schedule_shift_name"],
+                power_unit=current_payload["power_unit"],
+                uploader=uploader_name,
+                shift_start=current_payload["shift_start_str"],
+                shift_end=current_payload["shift_end_str"],
+                earliest_dt=current_payload["earliest_dt"],
+                final_dt=current_payload["final_dt"],
+                schedule=current_payload["schedule"],
+                peak_concurrent=current_payload["peak_concurrent"],
+                peak_wb70=current_payload["peak_wb70"],
+            )
+            # Keep the session snapshot's displayed signature aligned with the save.
+            current_payload["uploader"] = uploader_name
+            st.session_state["current_generated_schedule"] = current_payload
+            uploaded_display = datetime.fromisoformat(uploaded_at).strftime("%Y-%m-%d %H:%M:%S")
+            st.success(
+                f"💾 Current generated schedule saved to Calendar as revision v{new_revision} for "
+                f"{current_payload['schedule_date'].strftime('%Y-%m-%d')} • "
+                f"{current_payload['schedule_shift_name']} • {current_payload['power_unit']}. "
+                f"Upload time: {uploaded_display} (Türkiye time)."
+            )
+        except Exception as exc:
+            st.error(f"Could not save the current generated schedule: {str(exc)}")
+
+    render_generated_schedule(current_payload)
