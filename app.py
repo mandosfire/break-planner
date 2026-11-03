@@ -91,7 +91,8 @@ if page == "Break Planner":
     st.markdown(
         "Maximize on-duty staff while strictly enforcing meal windows, shift limits, "
         "inside-time rules, fixed WB70 times, per-moderator WB70 durations, moderator break entitlements, "
-        "and queue-pressure-aware break placement. Meal breaks are never allowed to be the first break."
+        "ticket coverage, and queue-pressure-aware break placement. Meal breaks are never allowed to be the first break, "
+        "and non-fixed WB70s can optionally be restricted to the first half of the shift."
     )
 
     # ==========================================
@@ -160,6 +161,22 @@ if page == "Break Planner":
     dur_wb20 = int(st.sidebar.number_input("WB20 Break", value=20, step=5))
     dur_wb70 = int(st.sidebar.number_input("WB70 Break", value=70, step=5))
 
+    st.sidebar.subheader("WB70 Placement")
+    allow_wb70_second_half = st.sidebar.toggle(
+        "Allow WB70s in second half of shift",
+        value=False,
+        help=(
+            "When off, every non-fixed WB70 must finish by the exact midpoint of the shift. "
+            "A moderator with a Fixed WB70 Start always follows that fixed time, even if it falls in or extends into the second half."
+        ),
+    )
+    if allow_wb70_second_half:
+        st.sidebar.caption("WB70 placement: second-half WB70s are allowed.")
+    else:
+        st.sidebar.caption(
+            "WB70 placement: non-fixed WB70s must finish by the shift midpoint. Fixed WB70 times override this rule."
+        )
+
     if shift_preset in ("Morning", "Mid"):
         st.sidebar.caption(
             "Pressure model: base volume 1836. The 15:00–16:30 Morning/Mid overlap is treated as two-shift coverage (50% relative pressure)."
@@ -213,6 +230,26 @@ def safe_nonnegative_int(value):
         return max(0, int(value))
     except Exception:
         return 0
+
+
+def parse_nonnegative_whole_number(value, field_name, moderator_name):
+    """Strict parser for text-backed entitlement cells used in the moderator grid."""
+    if value is None or pd.isna(value) or str(value).strip() == "":
+        return 0
+
+    raw = str(value).strip()
+    try:
+        numeric = float(raw)
+    except Exception as exc:
+        raise ValueError(
+            f"{moderator_name}: {field_name} must be a non-negative whole number."
+        ) from exc
+
+    if not numeric.is_integer() or numeric < 0:
+        raise ValueError(
+            f"{moderator_name}: {field_name} must be a non-negative whole number."
+        )
+    return int(numeric)
 
 
 def safe_bool(value):
@@ -271,6 +308,7 @@ def build_candidate_patterns(
     min_inside,
     max_inside,
     fixed_wb70_mins,
+    allow_wb70_second_half,
     max_patterns=MAX_PATTERNS_PER_PROFILE,
 ):
     """
@@ -283,6 +321,8 @@ def build_candidate_patterns(
       - min/max inside time before, between and after breaks
       - normal Meal Window unless WB70 exists
       - exact Fixed WB70 start when provided
+      - optional first-half-only WB70 placement for non-fixed WB70s
+      - fixed WB70 times override the first-half-only setting
       - 5-minute break-start grid
 
     The global optimizer then only chooses WHICH valid candidate each moderator uses.
@@ -309,6 +349,7 @@ def build_candidate_patterns(
         min_inside,
         max_inside,
         fixed_wb70_mins,
+        bool(allow_wb70_second_half),
     )
     rng = random.Random(profile_seed(profile_key))
     rng.shuffle(orders)
@@ -364,6 +405,7 @@ def build_candidate_patterns(
                     return
 
                 if b_type == "WB70" and fixed_wb70_mins is not None:
+                    # Fixed WB70 always overrides the first-half-only setting.
                     if (
                         fixed_wb70_mins < low
                         or fixed_wb70_mins > high
@@ -373,6 +415,14 @@ def build_candidate_patterns(
                     else:
                         candidate_starts = [fixed_wb70_mins]
                 else:
+                    if b_type == "WB70" and not allow_wb70_second_half:
+                        # "Not allowed in the second half" means the entire non-fixed
+                        # WB70 must be complete by the exact midpoint of the shift.
+                        shift_midpoint = total_shift_mins / 2.0
+                        latest_first_half_start = floor_step(shift_midpoint - dur)
+                        high = min(high, latest_first_half_start)
+                        if high < low:
+                            return
                     candidate_starts = list(range(low, high + 1, TIME_STEP))
                     rng.shuffle(candidate_starts)
 
@@ -1441,6 +1491,15 @@ def render_generated_schedule(payload):
             f"minimum simultaneously on duty during breakable intervals: {payload.get('min_ticket_on_duty', 1)}."
         )
 
+    wb70_midpoint = payload.get("wb70_shift_midpoint")
+    if payload.get("allow_wb70_second_half", True):
+        st.caption("🧘 WB70 placement: second-half WB70s were allowed for this generated schedule.")
+    elif wb70_midpoint is not None:
+        st.caption(
+            f"🧘 WB70 placement: non-fixed WB70s were required to finish by the shift midpoint "
+            f"({wb70_midpoint.strftime('%H:%M')}). Fixed WB70 Start values override this rule."
+        )
+
     if shift_preset in ("Morning", "Mid"):
         st.caption(
             "Pressure-aware optimization active: 15:00–16:30 Morning/Mid overlap is preferred for concurrency because two shifts are covering the queue."
@@ -1488,7 +1547,7 @@ def render_generated_schedule(payload):
         "displayModeBar": True,
     }
 
-    st.plotly_chart(fig_gantt, use_container_width=True, config=plotly_config)
+    st.plotly_chart(fig_gantt, width="stretch", config=plotly_config)
 
     try:
         img_bytes = fig_gantt.to_image(
@@ -1543,7 +1602,7 @@ def render_generated_schedule(payload):
         margin=dict(l=0, r=0, t=20, b=40),
         height=300,
     )
-    st.plotly_chart(fig_concurrency, use_container_width=True)
+    st.plotly_chart(fig_concurrency, width="stretch")
 
     # --- Concurrent Break Heatmap ---
     st.markdown(
@@ -1583,7 +1642,7 @@ def render_generated_schedule(payload):
             "displayModeBar": True,
         }
         st.plotly_chart(
-            fig_heatmap, use_container_width=True, config=heatmap_config
+            fig_heatmap, width="stretch", config=heatmap_config
         )
 
         try:
@@ -1661,7 +1720,7 @@ def render_generated_schedule(payload):
         height=280,
         showlegend=False,
     )
-    st.plotly_chart(fig_pressure, use_container_width=True)
+    st.plotly_chart(fig_pressure, width="stretch")
 
 def render_schedule_calendar():
     try:
@@ -1679,7 +1738,7 @@ def render_schedule_calendar():
 
     month_date = st.session_state.calendar_month
     nav_left, nav_title, nav_right = st.columns([1, 5, 1])
-    if nav_left.button("← Previous", use_container_width=True):
+    if nav_left.button("← Previous", width="stretch"):
         if month_date.month == 1:
             st.session_state.calendar_month = month_date.replace(year=month_date.year - 1, month=12, day=1)
         else:
@@ -1689,7 +1748,7 @@ def render_schedule_calendar():
         f"<h3 style='text-align:center; margin-top:4px'>{month_date.strftime('%B %Y')}</h3>",
         unsafe_allow_html=True,
     )
-    if nav_right.button("Next →", use_container_width=True):
+    if nav_right.button("Next →", width="stretch"):
         if month_date.month == 12:
             st.session_state.calendar_month = month_date.replace(year=month_date.year + 1, month=1, day=1)
         else:
@@ -1715,7 +1774,7 @@ def render_schedule_calendar():
                 label,
                 key=f"calendar_day_{month_date.year}_{month_date.month}_{day_num}",
                 type="primary" if day_date == selected_date else "secondary",
-                use_container_width=True,
+                width="stretch",
                 help=(f"{count} current schedule(s)" if count else "No saved schedules"),
             ):
                 st.session_state.calendar_selected_date = day_date
@@ -1745,7 +1804,7 @@ def render_schedule_calendar():
         }
         for r in records
     ])
-    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    st.dataframe(summary_df, width="stretch", hide_index=True)
 
     for rec_idx, record in enumerate(records):
         label = f"{record['shift_name']} • {record['power_unit']} • v{_revision_number(record)}"
@@ -1771,7 +1830,7 @@ def render_schedule_calendar():
             )
             timetable_filename = build_export_filename("Timetable", saved_date, record["shift_name"], record["power_unit"])
             st.plotly_chart(
-                fig_gantt, use_container_width=True, key=f"saved_gantt_{record['schedule_id']}_{rec_idx}",
+                fig_gantt, width="stretch", key=f"saved_gantt_{record['schedule_id']}_{rec_idx}",
                 config={"toImageButtonOptions": {"format": "png", "filename": timetable_filename.rsplit(".", 1)[0], "height": dynamic_height, "width": 1800, "scale": 3}, "displayModeBar": True},
             )
             try:
@@ -1781,7 +1840,7 @@ def render_schedule_calendar():
                 st.caption("Install kaleido to enable the one-click PNG download button.")
 
             with st.expander("View break list"):
-                st.dataframe(schedule_to_display_df(schedule), use_container_width=True, hide_index=True)
+                st.dataframe(schedule_to_display_df(schedule), width="stretch", hide_index=True)
 
             earliest_dt = datetime.fromisoformat(str(record["earliest_iso"]))
             final_dt = datetime.fromisoformat(str(record["final_iso"]))
@@ -1791,7 +1850,7 @@ def render_schedule_calendar():
             if fig_heatmap is not None:
                 heatmap_filename = build_export_filename("Break_Overlap_Heatmap", saved_date, record["shift_name"], record["power_unit"])
                 st.plotly_chart(
-                    fig_heatmap, use_container_width=True, key=f"saved_heatmap_{record['schedule_id']}_{rec_idx}",
+                    fig_heatmap, width="stretch", key=f"saved_heatmap_{record['schedule_id']}_{rec_idx}",
                     config={"toImageButtonOptions": {"format": "png", "filename": heatmap_filename.rsplit(".", 1)[0], "height": heatmap_height, "width": 1800, "scale": 3}, "displayModeBar": True},
                 )
                 try:
@@ -1812,7 +1871,7 @@ def render_schedule_calendar():
                     }
                     for r in revisions
                 ])
-                st.dataframe(history_df, use_container_width=True, hide_index=True)
+                st.dataframe(history_df, width="stretch", hide_index=True)
 
                 revision_options = {_revision_number(r): r for r in revisions}
                 selected_revision_num = st.selectbox(
@@ -1825,7 +1884,7 @@ def render_schedule_calendar():
                 selected_break_map = load_break_rows_for_schedule_ids([selected_revision["schedule_id"]])
                 selected_schedule = schedule_from_break_rows(selected_break_map.get(str(selected_revision["schedule_id"]), []))
                 if selected_schedule:
-                    st.dataframe(schedule_to_display_df(selected_schedule), use_container_width=True, hide_index=True)
+                    st.dataframe(schedule_to_display_df(selected_schedule), width="stretch", hide_index=True)
 
                 restore_col1, restore_col2 = st.columns([2, 1])
                 restore_by = restore_col1.text_input(
@@ -1836,7 +1895,7 @@ def render_schedule_calendar():
                 restore_clicked = restore_col2.button(
                     f"♻️ Restore v{selected_revision_num}",
                     disabled=safe_bool(selected_revision.get("is_current", False)) or not bool(selected_schedule),
-                    use_container_width=True,
+                    width="stretch",
                     key=f"restore_btn_{record['schedule_id']}_{selected_revision_num}",
                 )
                 if restore_clicked:
@@ -1959,7 +2018,10 @@ st.caption(
     "Meal Exception is automatic: if WB70s > 0, that moderator's Meal is not restricted to the normal Meal Window. "
     "WB70 Duration (mins) is optional: leave it blank to use the universal WB70 duration from the sidebar, "
     "or enter a moderator-specific duration such as 40, 50 or 60 minutes. "
-    "Tick Ticket Moderator for moderators who must maintain ticket coverage; the optimizer will never place all designated ticket moderators on break at the same time."
+    "Use the WB70 Placement toggle in the sidebar to allow or prevent non-fixed WB70s from entering the second half of the shift; "
+    "Fixed WB70 Start always overrides that toggle. "
+    "Tick Ticket Moderator for moderators who must maintain ticket coverage; the optimizer will never place all designated ticket moderators on break at the same time. "
+    "Entitlement fields are intentionally text-backed for Streamlit Cloud stability; enter whole numbers only."
 )
 
 default_data = [
@@ -1980,25 +2042,52 @@ default_data = [
     {"Name": "Zeynep Öykü Ercan", "Shorts": 3, "Meals": 1, "WB20s": 1, "WB70s": 0, "WB70 Duration (mins)": None, "Fixed WB70 Start": "", "Ticket Moderator": False},
 ]
 
+moderator_editor_df = pd.DataFrame(default_data)
+
+# Compatibility hardening for Streamlit Community Cloud:
+# keep entitlement cells text-backed so editing them does not invoke Glide's
+# lazily-loaded number-overlay-editor JavaScript module. The values are parsed
+# and validated as whole numbers before optimization.
+text_numeric_columns = [
+    "Shorts",
+    "Meals",
+    "WB20s",
+    "WB70s",
+    "WB70 Duration (mins)",
+]
+for col in text_numeric_columns:
+    moderator_editor_df[col] = moderator_editor_df[col].apply(
+        lambda value: "" if value is None or pd.isna(value) else str(int(value))
+    )
+
 edited_df = st.data_editor(
-    pd.DataFrame(default_data),
+    moderator_editor_df,
     num_rows="dynamic",
-    use_container_width=True,
+    width="stretch",
     column_config={
+        "Shorts": st.column_config.TextColumn(
+            "Shorts", help="Number of Short breaks. Enter a non-negative whole number."
+        ),
+        "Meals": st.column_config.TextColumn(
+            "Meals", help="Number of Meal breaks. Enter a non-negative whole number."
+        ),
+        "WB20s": st.column_config.TextColumn(
+            "WB20s", help="Number of WB20 breaks. Enter a non-negative whole number."
+        ),
+        "WB70s": st.column_config.TextColumn(
+            "WB70s", help="Number of WB70 breaks. Enter a non-negative whole number."
+        ),
         "Ticket Moderator": st.column_config.CheckboxColumn(
             "Ticket Moderator",
             help="Designated ticket moderators are protected so at least one remains on duty at every 5-minute interval.",
             default=False,
         ),
-        "WB70 Duration (mins)": st.column_config.NumberColumn(
+        "WB70 Duration (mins)": st.column_config.TextColumn(
             "WB70 Duration (mins)",
             help=(
                 "Optional moderator-specific WB70 duration. Leave blank to use the universal WB70 duration "
-                "from the sidebar. Examples: 40, 50, 60."
+                "from the sidebar. Examples: 40, 50, 60. Enter a positive whole number."
             ),
-            min_value=5,
-            step=5,
-            format="%d",
         ),
         "Fixed WB70 Start": st.column_config.TextColumn(
             "Fixed WB70 Start",
@@ -2014,11 +2103,11 @@ button_col1, button_col2 = st.columns(2)
 generate_clicked = button_col1.button(
     "🚀 Generate Optimized Schedule",
     type="primary",
-    use_container_width=True,
+    width="stretch",
 )
 generate_save_clicked = button_col2.button(
     "💾 Generate & Save to Calendar",
-    use_container_width=True,
+    width="stretch",
 )
 
 if generate_clicked or generate_save_clicked:
@@ -2097,12 +2186,16 @@ if generate_clicked or generate_save_clicked:
                 if not name or name.lower() == "nan":
                     continue
 
-                counts = {
-                    "Short": safe_nonnegative_int(row.get("Shorts", 0)),
-                    "Meal": safe_nonnegative_int(row.get("Meals", 0)),
-                    "WB20": safe_nonnegative_int(row.get("WB20s", 0)),
-                    "WB70": safe_nonnegative_int(row.get("WB70s", 0)),
-                }
+                try:
+                    counts = {
+                        "Short": parse_nonnegative_whole_number(row.get("Shorts", 0), "Shorts", name),
+                        "Meal": parse_nonnegative_whole_number(row.get("Meals", 0), "Meals", name),
+                        "WB20": parse_nonnegative_whole_number(row.get("WB20s", 0), "WB20s", name),
+                        "WB70": parse_nonnegative_whole_number(row.get("WB70s", 0), "WB70s", name),
+                    }
+                except ValueError as exc:
+                    st.error(f"❌ {exc}")
+                    st.stop()
                 if sum(counts.values()) == 0:
                     continue
 
@@ -2152,6 +2245,7 @@ if generate_clicked or generate_save_clicked:
                     tuple((b, counts[b]) for b in BREAK_TYPES),
                     tuple((b, effective_durations[b]) for b in BREAK_TYPES),
                     fixed_mins,
+                    bool(allow_wb70_second_half),
                 )
 
                 if profile not in profile_cache:
@@ -2166,6 +2260,7 @@ if generate_clicked or generate_save_clicked:
                         min_inside=min_gap,
                         max_inside=max_gap,
                         fixed_wb70_mins=fixed_mins,
+                        allow_wb70_second_half=allow_wb70_second_half,
                     )
                     profile_cache[profile] = patterns
 
@@ -2176,6 +2271,9 @@ if generate_clicked or generate_save_clicked:
                         extra += f" Fixed WB70 start: {row.get('Fixed WB70 Start', '')}."
                     if counts["WB70"] > 0:
                         extra += f" WB70 duration: {effective_durations['WB70']} minutes."
+                        if not allow_wb70_second_half and fixed_mins is None:
+                            midpoint_dt = shift_start_dt + timedelta(minutes=total_shift_mins / 2.0)
+                            extra += f" Non-fixed WB70 must finish by shift midpoint ({midpoint_dt.strftime('%H:%M')})."
                     st.error(
                         f"❌ No individually feasible break layout exists for {name} under the current rules.{extra} "
                         "This is a genuine moderator-level rule conflict, not a solver timeout."
@@ -2322,6 +2420,8 @@ if generate_clicked or generate_save_clicked:
                 "peak_wb70": int(result["WB70Peak"]),
                 "ticket_moderator_count": ticket_count,
                 "min_ticket_on_duty": min_ticket_on_duty,
+                "allow_wb70_second_half": bool(allow_wb70_second_half),
+                "wb70_shift_midpoint": shift_start_dt + timedelta(minutes=total_shift_mins / 2.0),
                 "used_fallback": bool(result["UsedFallback"]),
                 "concurrency_df": concurrency_df,
                 "shift_preset": shift_preset,
@@ -2378,7 +2478,7 @@ if current_payload:
         save_current_clicked = st.button(
             "💾 Save Current Generated Schedule to Calendar",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             key="save_current_generated_schedule",
         )
     with note_col:
