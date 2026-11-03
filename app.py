@@ -91,8 +91,7 @@ if page == "Break Planner":
     st.markdown(
         "Maximize on-duty staff while strictly enforcing meal windows, shift limits, "
         "inside-time rules, fixed WB70 times, per-moderator WB70 durations, moderator break entitlements, "
-        "ticket coverage, and queue-pressure-aware break placement. Meal breaks are never allowed to be the first break, "
-        "and non-fixed WB70s can optionally be restricted to the first half of the shift."
+        "and queue-pressure-aware break placement. Meal breaks are never allowed to be the first break."
     )
 
     # ==========================================
@@ -160,22 +159,6 @@ if page == "Break Planner":
     dur_meal = int(st.sidebar.number_input("Meal Break", value=30, step=5))
     dur_wb20 = int(st.sidebar.number_input("WB20 Break", value=20, step=5))
     dur_wb70 = int(st.sidebar.number_input("WB70 Break", value=70, step=5))
-
-    st.sidebar.subheader("WB70 Placement")
-    allow_wb70_second_half = st.sidebar.toggle(
-        "Allow WB70s in second half of shift",
-        value=False,
-        help=(
-            "When off, every non-fixed WB70 must finish by the exact midpoint of the shift. "
-            "A moderator with a Fixed WB70 Start always follows that fixed time, even if it falls in or extends into the second half."
-        ),
-    )
-    if allow_wb70_second_half:
-        st.sidebar.caption("WB70 placement: second-half WB70s are allowed.")
-    else:
-        st.sidebar.caption(
-            "WB70 placement: non-fixed WB70s must finish by the shift midpoint. Fixed WB70 times override this rule."
-        )
 
     if shift_preset in ("Morning", "Mid"):
         st.sidebar.caption(
@@ -288,7 +271,6 @@ def build_candidate_patterns(
     min_inside,
     max_inside,
     fixed_wb70_mins,
-    allow_wb70_second_half,
     max_patterns=MAX_PATTERNS_PER_PROFILE,
 ):
     """
@@ -301,8 +283,6 @@ def build_candidate_patterns(
       - min/max inside time before, between and after breaks
       - normal Meal Window unless WB70 exists
       - exact Fixed WB70 start when provided
-      - optional first-half-only WB70 placement for non-fixed WB70s
-      - fixed WB70 times override the first-half-only setting
       - 5-minute break-start grid
 
     The global optimizer then only chooses WHICH valid candidate each moderator uses.
@@ -329,7 +309,6 @@ def build_candidate_patterns(
         min_inside,
         max_inside,
         fixed_wb70_mins,
-        bool(allow_wb70_second_half),
     )
     rng = random.Random(profile_seed(profile_key))
     rng.shuffle(orders)
@@ -385,7 +364,6 @@ def build_candidate_patterns(
                     return
 
                 if b_type == "WB70" and fixed_wb70_mins is not None:
-                    # Fixed WB70 always overrides the first-half-only setting.
                     if (
                         fixed_wb70_mins < low
                         or fixed_wb70_mins > high
@@ -395,14 +373,6 @@ def build_candidate_patterns(
                     else:
                         candidate_starts = [fixed_wb70_mins]
                 else:
-                    if b_type == "WB70" and not allow_wb70_second_half:
-                        # "Not allowed in the second half" means the entire non-fixed
-                        # WB70 must be complete by the exact midpoint of the shift.
-                        shift_midpoint = total_shift_mins / 2.0
-                        latest_first_half_start = floor_step(shift_midpoint - dur)
-                        high = min(high, latest_first_half_start)
-                        if high < low:
-                            return
                     candidate_starts = list(range(low, high + 1, TIME_STEP))
                     rng.shuffle(candidate_starts)
 
@@ -1471,15 +1441,6 @@ def render_generated_schedule(payload):
             f"minimum simultaneously on duty during breakable intervals: {payload.get('min_ticket_on_duty', 1)}."
         )
 
-    wb70_midpoint = payload.get("wb70_shift_midpoint")
-    if payload.get("allow_wb70_second_half", True):
-        st.caption("🧘 WB70 placement: second-half WB70s were allowed for this generated schedule.")
-    elif wb70_midpoint is not None:
-        st.caption(
-            f"🧘 WB70 placement: non-fixed WB70s were required to finish by the shift midpoint "
-            f"({wb70_midpoint.strftime('%H:%M')}). Fixed WB70 Start values override this rule."
-        )
-
     if shift_preset in ("Morning", "Mid"):
         st.caption(
             "Pressure-aware optimization active: 15:00–16:30 Morning/Mid overlap is preferred for concurrency because two shifts are covering the queue."
@@ -1998,8 +1959,6 @@ st.caption(
     "Meal Exception is automatic: if WB70s > 0, that moderator's Meal is not restricted to the normal Meal Window. "
     "WB70 Duration (mins) is optional: leave it blank to use the universal WB70 duration from the sidebar, "
     "or enter a moderator-specific duration such as 40, 50 or 60 minutes. "
-    "Use the WB70 Placement toggle in the sidebar to allow or prevent non-fixed WB70s from entering the second half of the shift; "
-    "Fixed WB70 Start always overrides that toggle. "
     "Tick Ticket Moderator for moderators who must maintain ticket coverage; the optimizer will never place all designated ticket moderators on break at the same time."
 )
 
@@ -2193,7 +2152,6 @@ if generate_clicked or generate_save_clicked:
                     tuple((b, counts[b]) for b in BREAK_TYPES),
                     tuple((b, effective_durations[b]) for b in BREAK_TYPES),
                     fixed_mins,
-                    bool(allow_wb70_second_half),
                 )
 
                 if profile not in profile_cache:
@@ -2208,7 +2166,6 @@ if generate_clicked or generate_save_clicked:
                         min_inside=min_gap,
                         max_inside=max_gap,
                         fixed_wb70_mins=fixed_mins,
-                        allow_wb70_second_half=allow_wb70_second_half,
                     )
                     profile_cache[profile] = patterns
 
@@ -2219,9 +2176,6 @@ if generate_clicked or generate_save_clicked:
                         extra += f" Fixed WB70 start: {row.get('Fixed WB70 Start', '')}."
                     if counts["WB70"] > 0:
                         extra += f" WB70 duration: {effective_durations['WB70']} minutes."
-                        if not allow_wb70_second_half and fixed_mins is None:
-                            midpoint_dt = shift_start_dt + timedelta(minutes=total_shift_mins / 2.0)
-                            extra += f" Non-fixed WB70 must finish by shift midpoint ({midpoint_dt.strftime('%H:%M')})."
                     st.error(
                         f"❌ No individually feasible break layout exists for {name} under the current rules.{extra} "
                         "This is a genuine moderator-level rule conflict, not a solver timeout."
@@ -2368,8 +2322,6 @@ if generate_clicked or generate_save_clicked:
                 "peak_wb70": int(result["WB70Peak"]),
                 "ticket_moderator_count": ticket_count,
                 "min_ticket_on_duty": min_ticket_on_duty,
-                "allow_wb70_second_half": bool(allow_wb70_second_half),
-                "wb70_shift_midpoint": shift_start_dt + timedelta(minutes=total_shift_mins / 2.0),
                 "used_fallback": bool(result["UsedFallback"]),
                 "concurrency_df": concurrency_df,
                 "shift_preset": shift_preset,
