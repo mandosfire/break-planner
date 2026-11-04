@@ -1,53 +1,19 @@
-"""Accessible, high-resolution PNG and CSV exports for Break Planner V11.2.
-Focused on cleaner, more legible timetable visuals while preserving colorblind-safe cues.
+"""V11 exports using the original V10 Plotly visual designs.
+Timetable and heatmap figures are ported directly from V10; individual views
+use the same Plotly typography, white background, bars, and break colors.
 """
 from __future__ import annotations
-from datetime import timedelta
+from datetime import datetime, timedelta
 from io import BytesIO, StringIO
 from zipfile import ZipFile, ZIP_DEFLATED
 import csv
-import math
 import re
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 
-from PIL import Image, ImageDraw, ImageFont
-
-# Accessible palette with strong contrast and text labels.
-COLORS = {
-    "Short": "#2F80ED",   # blue
-    "Meal": "#E3A008",    # amber
-    "WB20": "#14B8A6",    # teal
-    "WB70": "#8B5CF6",    # violet
-}
-LABELS = {
-    "Short": "S · Short",
-    "Meal": "M · Meal",
-    "WB20": "W20 · Wellness",
-    "WB70": "W70 · Wellness",
-}
-TAG_SHORT = {"Short": "S", "Meal": "M", "WB20": "W20", "WB70": "W70"}
-
-NAVY = "#102A43"
-INK = "#1F2937"
-MUTED = "#5B6B7A"
-LINE = "#D8E1EA"
-PALE = "#F6F9FC"
-PALE_ALT = "#EEF4F9"
-SURFACE = "#FFFFFF"
-WHITE = "#FFFFFF"
-SOFT_BADGE = "#EAF1F7"
-TICKET_BG = "#183B56"
-TICKET_FG = "#F8FBFF"
-
-FONT_REGULAR = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-
-
-def font(size: int, bold: bool = False):
-    path = FONT_BOLD if bold else FONT_REGULAR
-    try:
-        return ImageFont.truetype(path, size)
-    except OSError:
-        return ImageFont.load_default()
+TIME_STEP=5
 
 
 def fmt(dt):
@@ -63,301 +29,309 @@ def name_for(kind, payload, extension="png"):
     return f"{slug(kind)}_{slug(payload['date'])}_{slug(payload['pu'])}_{slug(payload['shift_code'])}.{extension}"
 
 
-def _png_bytes(im: Image.Image):
-    result = BytesIO()
-    im.save(result, format="PNG", optimize=True)
-    return result.getvalue()
+def _schedule_to_v10_dataframe(schedule):
+    """Map V11 break records to the same fields V10's Plotly timeline uses."""
+    result = []
+    for b in schedule:
+        start, finish = b["Start"], b["Finish"]
+        duration = int((finish - start).total_seconds() / 60)
+        if duration <= 20:
+            bar_text = f"<b>{fmt(start)}<br>{fmt(finish)}</b>"
+        else:
+            bar_text = f"<b>{fmt(start)}-{fmt(finish)}</b>"
+        result.append({
+            "Task": f"<b>{b['Name']}</b>",
+            "Resource": b["Resource"],
+            "Start": start,
+            "Finish": finish,
+            "Bar_Text": bar_text,
+        })
+    return pd.DataFrame(result, columns=["Task", "Resource", "Start", "Finish", "Bar_Text"]).sort_values(
+        ["Task", "Start"], ascending=[False, True]
+    )
 
 
-def _bbox(draw, text, f):
-    return draw.textbbox((0, 0), str(text), font=f)
+def _render_png(fig, width, height):
+    """Render the Plotly chart to the same 3x PNG output used in V10."""
+    try:
+        return fig.to_image(format="png", width=width, height=height, scale=3)
+    except Exception as exc:
+        raise RuntimeError(
+            "High-resolution V10-style PNG rendering requires the pinned plotly/kaleido "
+            "dependencies and a working Chrome/Chromium installation on the app server. "
+            f"Underlying error: {exc}"
+        ) from exc
 
+def build_break_overlap_heatmap_matrix(schedule, earliest_dt, final_dt):
+    """
+    Build an hour x 5-minute matrix of concurrent breaks.
 
-def _text_size(draw, text, f):
-    box = _bbox(draw, text, f)
-    return box[2] - box[0], box[3] - box[1]
+    Cells outside the allowed break window are NaN so they render blank.
+    Values inside the window are calculated directly from the final optimized
+    schedule, making the heatmap independent of solver internals.
+    """
+    if final_dt <= earliest_dt:
+        return np.empty((0, 12)), [], []
 
+    first_hour = earliest_dt.replace(minute=0, second=0, microsecond=0)
+    last_active_point = final_dt - timedelta(minutes=1)
+    last_hour = last_active_point.replace(minute=0, second=0, microsecond=0)
 
-def _fit_text(draw, text, max_width, start_size=28, min_size=14, bold=False):
-    text = str(text)
-    size = start_size
-    while size >= min_size:
-        f = font(size, bold)
-        w, _ = _text_size(draw, text, f)
-        if w <= max_width:
-            return text, f
-        size -= 1
-    f = font(min_size, bold)
-    candidate = text
-    while candidate:
-        trial = candidate.rstrip() + "…"
-        w, _ = _text_size(draw, trial, f)
-        if w <= max_width:
-            return trial, f
-        candidate = candidate[:-1]
-    return "…", f
+    hour_starts = []
+    cursor = first_hour
+    while cursor <= last_hour:
+        hour_starts.append(cursor)
+        cursor += timedelta(hours=1)
 
+    minute_marks = list(range(0, 60, TIME_STEP))
+    matrix = np.full((len(hour_starts), len(minute_marks)), np.nan, dtype=float)
 
-def _draw_text_fit(draw, xy, text, max_width, start_size=28, min_size=14, bold=False, fill=INK):
-    text2, f = _fit_text(draw, text, max_width, start_size, min_size, bold)
-    draw.text(xy, text2, font=f, fill=fill)
-    return f
+    for row_idx, hour_start in enumerate(hour_starts):
+        for col_idx, minute in enumerate(minute_marks):
+            slot_dt = hour_start + timedelta(minutes=minute)
+            if earliest_dt <= slot_dt < final_dt:
+                matrix[row_idx, col_idx] = sum(
+                    1 for b in schedule if b["Start"] <= slot_dt < b["Finish"]
+                )
 
+    row_labels = [dt.strftime("%H:00") for dt in hour_starts]
+    col_labels = [f":{minute:02d}" for minute in minute_marks]
+    return matrix, row_labels, col_labels
 
-def _centered_text(draw, box, text, size, bold=False, fill=WHITE):
-    f = font(size, bold)
-    w, h = _text_size(draw, text, f)
-    x0, y0, x1, y1 = box
-    draw.text((x0 + (x1 - x0 - w) / 2, y0 + (y1 - y0 - h) / 2 - 1), text, font=f, fill=fill)
+def create_break_overlap_heatmap(
+    schedule,
+    earliest_dt,
+    final_dt,
+    schedule_date=None,
+    shift_name=None,
+    power_unit=None,
+):
+    """Create the management-facing concurrent-break heatmap."""
+    matrix, row_labels, col_labels = build_break_overlap_heatmap_matrix(
+        schedule, earliest_dt, final_dt
+    )
 
+    if matrix.size == 0 or not np.any(~np.isnan(matrix)):
+        return None, 0
 
-def _rounded(draw, box, radius, fill, outline=None, width=1):
-    draw.rounded_rectangle(box, radius=radius, fill=fill, outline=outline, width=width)
+    valid_values = matrix[~np.isnan(matrix)]
+    z_min = float(np.min(valid_values))
+    z_max = float(np.max(valid_values))
 
+    # Avoid a zero-width color range when every valid cell has the same value.
+    display_zmax = z_max if z_max > z_min else z_min + 1.0
 
-def _badge(draw, x, y, text, fill=SOFT_BADGE, text_fill=INK, outline=None, pad_x=18, pad_y=10, size=20, bold=False):
-    f = font(size, bold)
-    w, h = _text_size(draw, text, f)
-    box = (x, y, x + w + pad_x * 2, y + h + pad_y * 2)
-    _rounded(draw, box, 18, fill=fill, outline=outline or fill, width=1)
-    draw.text((x + pad_x, y + pad_y - 1), text, font=f, fill=text_fill)
-    return box[2]
+    # Approved palette: very light dusty pink at the low end, moving through
+    # rose/mauve into saturated deep violet for the highest concurrency.
+    light_pink_to_violet = [
+        [0.00, "#F8CDD8"],
+        [0.20, "#F1B7CF"],
+        [0.40, "#DF91C2"],
+        [0.60, "#C261B4"],
+        [0.80, "#9230A6"],
+        [1.00, "#56006F"],
+    ]
 
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=matrix,
+            x=col_labels,
+            y=row_labels,
+            colorscale=light_pink_to_violet,
+            zmin=z_min,
+            zmax=display_zmax,
+            colorbar=dict(
+                title=dict(text="Concurrent<br>breaks", side="right"),
+                tickmode="linear",
+                dtick=1,
+                thickness=26,
+                len=1.0,
+            ),
+            hovertemplate=(
+                "Hour: %{y}<br>"
+                "5-minute interval: %{x}<br>"
+                "Concurrent breaks: %{z:.0f}"
+                "<extra></extra>"
+            ),
+            hoverongaps=False,
+            showscale=True,
+        )
+    )
 
-def _legend_badge(draw, x, y, kind, label):
-    color = COLORS[kind]
-    f = font(19, True)
-    txt_w, txt_h = _text_size(draw, label, f)
-    w = txt_w + 84
-    box = (x, y, x + w, y + 44)
-    _rounded(draw, box, 14, fill=WHITE, outline=LINE, width=2)
-    _rounded(draw, (x + 8, y + 8, x + 36, y + 36), 8, fill=color)
-    draw.text((x + 46, y + 10), label, font=f, fill=INK)
-    return box[2]
+    # Add numeric labels with automatic black/white contrast.
+    span = max(display_zmax - z_min, 1.0)
+    for row_idx, row_label in enumerate(row_labels):
+        for col_idx, col_label in enumerate(col_labels):
+            value = matrix[row_idx, col_idx]
+            if np.isnan(value):
+                continue
+            normalized = (float(value) - z_min) / span
+            font_color = "white" if normalized >= 0.52 else "black"
+            fig.add_annotation(
+                x=col_label,
+                y=row_label,
+                text=f"<b>{int(value)}</b>",
+                showarrow=False,
+                font=dict(
+                    family="Montserrat, sans-serif",
+                    size=13,
+                    color=font_color,
+                ),
+            )
 
+    heatmap_height = max(520, len(row_labels) * 78 + 175)
+    fig.update_layout(
+        title=dict(
+            text=(
+                "<b>Concurrent Break Heatmap</b><br>"
+                + (
+                    f"<span style='font-size:13px'>Date: {schedule_date.strftime('%Y-%m-%d') if hasattr(schedule_date, 'strftime') else schedule_date} "
+                    f"| Shift: {shift_name or '—'} | Power Unit: {power_unit or '—'} "
+                    f"| Break Window: {earliest_dt.strftime('%H:%M')}–{final_dt.strftime('%H:%M')}</span>"
+                    if schedule_date is not None or shift_name or power_unit
+                    else f"Entire Shift ({earliest_dt.strftime('%H:%M')}–{final_dt.strftime('%H:%M')})"
+                )
+            ),
+            x=0.5,
+            xanchor="center",
+            font=dict(family="Montserrat, sans-serif", size=21, color="black"),
+        ),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        font=dict(family="Montserrat, sans-serif", color="black", size=12),
+        xaxis=dict(
+            title="<b>5-minute interval</b>",
+            side="bottom",
+            showgrid=False,
+            fixedrange=False,
+        ),
+        yaxis=dict(
+            title="<b>Hour</b>",
+            autorange="reversed",
+            showgrid=False,
+            fixedrange=False,
+        ),
+        margin=dict(l=75, r=90, t=110, b=65),
+        height=heatmap_height,
+    )
 
-def _bar_text_color(kind):
-    return INK if kind == "Meal" else WHITE
+    return fig, heatmap_height
 
+def create_timetable_figure(
+    sched_df,
+    schedule_date,
+    shift_name,
+    power_unit,
+    shift_start_str,
+    shift_end_str,
+):
+    """Build the timetable figure used by both the Planner and Calendar pages."""
+    color_map = {
+        "Short": "#3b82f6",
+        "Meal": "#f97316",
+        "WB20": "#22c55e",
+        "WB70": "#a855f7",
+    }
 
-def _minutes_between(a, b):
-    return (b - a).total_seconds() / 60.0
+    fig = px.timeline(
+        sched_df,
+        x_start="Start",
+        x_end="Finish",
+        y="Task",
+        color="Resource",
+        text="Bar_Text",
+        color_discrete_map=color_map,
+    )
+    fig.update_traces(
+        textposition="inside",
+        insidetextanchor="middle",
+        textangle=0,
+        textfont=dict(family="Montserrat, sans-serif", color="white", size=11),
+        marker=dict(line=dict(width=1, color="rgba(255, 255, 255, 0.6)")),
+    )
+
+    num_moderators = len(sched_df["Task"].unique())
+    dynamic_height = max(650, num_moderators * 45 + 210)
+    date_text = (
+        schedule_date.strftime("%Y-%m-%d")
+        if hasattr(schedule_date, "strftime")
+        else str(schedule_date)
+    )
+    title_text = (
+        "<b>Shift Break Timetable</b><br>"
+        f"<span style='font-size:14px'>Date: {date_text} | Shift: {shift_name} | "
+        f"Power Unit: {power_unit} | {shift_start_str}–{shift_end_str}</span>"
+    )
+
+    fig.update_layout(
+        title=dict(
+            text=title_text,
+            x=0.5,
+            xanchor="center",
+            y=0.985,
+            yanchor="top",
+            font=dict(family="Montserrat, sans-serif", color="black", size=22),
+        ),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        font=dict(family="Montserrat, sans-serif", color="black", size=12),
+        xaxis=dict(
+            showgrid=True,
+            gridcolor="#e5e5e5",
+            tickformat="%H:%M",
+            dtick=3600000,
+            title="<b>Time</b>",
+            side="bottom",
+        ),
+        yaxis=dict(
+            showgrid=True,
+            gridcolor="#f3f4f6",
+            title="",
+            tickfont=dict(color="#1c2838", size=12, family="Montserrat, sans-serif"),
+        ),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.005,
+            xanchor="center",
+            x=0.5,
+            title="",
+        ),
+        margin=dict(l=0, r=0, t=125, b=40),
+        height=dynamic_height,
+    )
+    return fig, dynamic_height
 
 
 def generate_timetable_png(payload):
-    schedule = payload["schedule"]
-    shift_start = payload["shift_start_dt"]
-    shift_end = payload["shift_end_dt"]
-    total = _minutes_between(shift_start, shift_end)
-    if total <= 0:
-        raise ValueError("Shift end must be later than shift start")
-
-    names = sorted({b["Name"] for b in schedule}, key=lambda s: s.casefold())
-
-    # High-resolution canvas with more generous row height and name space.
-    W = 3800
-    name_col = 620
-    right_margin = 70
-    left_margin = 44
-    row_h = 90
-    top_header = 142
-    meta_h = 86
-    legend_h = 64
-    timeline_head_h = 62
-    top = top_header + meta_h + legend_h + timeline_head_h
-    bottom_pad = 64
-    H = max(980, top + len(names) * row_h + bottom_pad)
-
-    im = Image.new("RGB", (W, H), PALE)
-    d = ImageDraw.Draw(im)
-
-    # Outer card surface
-    _rounded(d, (18, 18, W - 18, H - 18), 26, fill=SURFACE, outline="#E7EEF5", width=2)
-    d.rectangle((18, 18, W - 18, top_header), fill=NAVY)
-
-    # Header
-    d.text((58, 42), "PU BREAK TIMETABLE", font=font(42, True), fill=WHITE)
-    sub = f"{payload['date']}   •   {payload['pu']}   •   {payload['shift_label']}   •   {fmt(shift_start)}–{fmt(shift_end)}"
-    d.text((60, 95), sub, font=font(23), fill="#D7E3F0")
-
-    right_x = W - 70
-    if payload.get("tickets", 0):
-        box_w = 260
-        _rounded(d, (right_x - box_w, 42, right_x, 86), 16, fill="#184468")
-        _centered_text(d, (right_x - box_w, 42, right_x, 86), f"Ticket mods: {payload['tickets']}", 20, True, WHITE)
-        right_x -= box_w + 16
-    _rounded(d, (right_x - 170, 42, right_x, 86), 16, fill="#1E4E78")
-    _centered_text(d, (right_x - 170, 42, right_x, 86), payload["shift_code"], 20, True, WHITE)
-
-    # Meta chips
-    y_meta = top_header + 18
-    x_meta = 56
-    x_meta = _badge(d, x_meta, y_meta, f"Date: {payload['date']}", fill="#EEF5FB", text_fill=INK, outline=LINE, size=21, bold=True) + 12
-    x_meta = _badge(d, x_meta, y_meta, f"Power Unit: {payload['pu']}", fill="#EEF5FB", text_fill=INK, outline=LINE, size=21, bold=True) + 12
-    _badge(d, x_meta, y_meta, f"Shift: {payload['shift_label']}", fill="#EEF5FB", text_fill=INK, outline=LINE, size=21, bold=True)
-
-    # Legend
-    legend_y = top_header + meta_h + 10
-    legend_x = 56
-    for kind in ["Short", "Meal", "WB20", "WB70"]:
-        legend_x = _legend_badge(d, legend_x, legend_y, kind, LABELS[kind]) + 14
-
-    # Timetable grid coordinates
-    x0 = left_margin + name_col
-    x1 = W - right_margin
-    # Name column header and timeline header backgrounds
-    _rounded(d, (left_margin, top - timeline_head_h + 6, name_col + left_margin - 20, top - 6), 14, fill=PALE_ALT, outline=LINE, width=1)
-    _rounded(d, (x0, top - timeline_head_h + 6, x1, top - 6), 14, fill=PALE_ALT, outline=LINE, width=1)
-    d.text((left_margin + 26, top - 48), "Moderator", font=font(24, True), fill=INK)
-    d.text((x0 + 18, top - 48), "Shift timeline", font=font(24, True), fill=INK)
-
-    # Hour / half-hour markers
-    for minute in range(0, int(total) + 1, 30):
-        x = x0 + round(minute / total * (x1 - x0))
-        thick = (minute % 60 == 0)
-        line_color = "#B8C6D4" if thick else "#E0E7EE"
-        d.line((x, top - 4, x, H - 38), fill=line_color, width=3 if thick else 1)
-        label_dt = shift_start + timedelta(minutes=minute)
-        time_text = fmt(label_dt)
-        f = font(18, thick)
-        w, _ = _text_size(d, time_text, f)
-        d.text((x - w / 2, top - 40), time_text, font=f, fill=MUTED)
-
-    # Rows
-    for idx, name in enumerate(names):
-        y = top + idx * row_h
-        row_fill = WHITE if idx % 2 == 0 else "#FBFDFF"
-        d.rectangle((left_margin, y, W - right_margin, y + row_h), fill=row_fill)
-        d.line((left_margin, y + row_h, W - right_margin, y + row_h), fill=LINE, width=1)
-        d.line((x0 - 18, y, x0 - 18, y + row_h), fill=LINE, width=2)
-
-        breaks = sorted([b for b in schedule if b["Name"] == name], key=lambda b: b["Start"])
-        is_ticket = any(b.get("TicketModerator") for b in breaks)
-
-        # Name area
-        name_x = left_margin + 18
-        if is_ticket:
-            _rounded(d, (name_x, y + 21, name_x + 36, y + 56), 10, fill=TICKET_BG)
-            _centered_text(d, (name_x, y + 21, name_x + 36, y + 56), "T", 18, True, TICKET_FG)
-            name_text_x = name_x + 52
-            name_width = name_col - 110
-        else:
-            name_text_x = name_x
-            name_width = name_col - 70
-        _draw_text_fit(d, (name_text_x, y + 18), name, name_width, start_size=26, min_size=17, bold=True, fill=INK)
-
-        # Bars
-        for b in breaks:
-            l = x0 + round(_minutes_between(shift_start, b["Start"]) / total * (x1 - x0))
-            r = x0 + round(_minutes_between(shift_start, b["Finish"]) / total * (x1 - x0))
-            if r - l < 8:
-                continue
-            kind = b["Resource"]
-            color = COLORS[kind]
-            box = (l + 3, y + 12, r - 3, y + row_h - 14)
-            _rounded(d, box, 12, fill=color, outline="#17324D", width=2)
-            text_fill = _bar_text_color(kind)
-
-            # Three-line bar label if there is enough room; otherwise compact mode.
-            width = box[2] - box[0]
-            tag = TAG_SHORT[kind]
-            if width >= 108:
-                _centered_text(d, (box[0], box[1] + 2, box[2], box[1] + 24), tag, 15, True, text_fill)
-                _centered_text(d, (box[0], box[1] + 20, box[2], box[1] + 42), fmt(b["Start"]), 13, True, text_fill)
-                _centered_text(d, (box[0], box[1] + 40, box[2], box[1] + 60), fmt(b["Finish"]), 13, True, text_fill)
-            elif width >= 70:
-                compact = f"{tag} {fmt(b['Start'])}–{fmt(b['Finish'])}"
-                txt, f = _fit_text(d, compact, width - 10, start_size=13, min_size=10, bold=True)
-                tw, th = _text_size(d, txt, f)
-                d.text((box[0] + (width - tw) / 2, box[1] + ((box[3] - box[1]) - th) / 2 - 1), txt, font=f, fill=text_fill)
-            else:
-                _centered_text(d, box, tag, 11, True, text_fill)
-
-    footer = "All times local · S=Short · M=Meal · W20/W70=Wellness · T=Ticket moderator"
-    d.text((left_margin, H - 34), footer, font=font(17), fill=MUTED)
-    return _png_bytes(im)
-
-
-# Colorblind-friendly Cividis-like gradient for heatmap, but rendered more elegantly.
-CIVIDIS = ["#15314B", "#35586B", "#66736F", "#948B5E", "#C7AA48", "#F0D34B"]
-
-
-def _hex_to_rgb(value):
-    return tuple(int(value[i:i + 2], 16) for i in (1, 3, 5))
-
-
-def _interp_color(percent):
-    percent = max(0, min(1, float(percent)))
-    u = percent * (len(CIVIDIS) - 1)
-    i = min(int(u), len(CIVIDIS) - 2)
-    frac = u - i
-    a, b = _hex_to_rgb(CIVIDIS[i]), _hex_to_rgb(CIVIDIS[i + 1])
-    return tuple(round(x + (y - x) * frac) for x, y in zip(a, b))
+    df = _schedule_to_v10_dataframe(payload["schedule"])
+    fig, dynamic_height = create_timetable_figure(
+        df,
+        payload["date"],
+        payload["shift_label"],
+        payload["pu"],
+        fmt(payload["shift_start_dt"]),
+        fmt(payload["shift_end_dt"]),
+    )
+    return _render_png(fig, width=1800, height=dynamic_height)
 
 
 def generate_heatmap_png(payload):
-    schedule = payload["schedule"]
-    start = payload["earliest_dt"].replace(minute=0, second=0, microsecond=0)
-    limit = payload["final_dt"]
-    hours = []
-    while start < limit:
-        hours.append(start)
-        start += timedelta(hours=1)
-
-    cellw = 126
-    cellh = 72
-    x0 = 220
-    top = 252
-    W = 1920
-    H = max(620, top + len(hours) * cellh + 130)
-    im = Image.new("RGB", (W, H), PALE)
-    d = ImageDraw.Draw(im)
-    _rounded(d, (18, 18, W - 18, H - 18), 24, fill=WHITE, outline="#E8EEF4", width=2)
-    d.rectangle((18, 18, W - 18, 146), fill=NAVY)
-    d.text((48, 34), "CONCURRENT BREAKS · 5-MINUTE VIEW", font=font(33, True), fill=WHITE)
-    d.text((48, 91), f"{payload['date']}   •   {payload['pu']}   •   {payload['shift_label']}   •   {fmt(payload['earliest_dt'])}–{fmt(payload['final_dt'])}", font=font(21), fill="#DBE8F4")
-
-    counts = []
-    for h in hours:
-        row = []
-        for m in range(0, 60, 5):
-            t = h + timedelta(minutes=m)
-            if not payload["earliest_dt"] <= t < payload["final_dt"]:
-                row.append(None)
-            else:
-                row.append(sum(1 for b in schedule if b["Start"] <= t < b["Finish"]))
-        counts.append(row)
-    mx = max((v for row in counts for v in row if v is not None), default=1)
-
-    _rounded(d, (34, top - 54, W - 36, H - 56), 18, fill="#FBFDFF", outline=LINE, width=1)
-    for ci, m in enumerate(range(0, 60, 5)):
-        label = f":{m:02d}"
-        f = font(19, True)
-        w, _ = _text_size(d, label, f)
-        d.text((x0 + ci * cellw + (cellw - w) / 2, top - 35), label, font=f, fill=INK)
-
-    for ri, h in enumerate(hours):
-        y = top + ri * cellh
-        d.text((40, y + 21), h.strftime("%H:00"), font=font(22, True), fill=INK)
-        for ci, v in enumerate(counts[ri]):
-            x = x0 + ci * cellw
-            box = (x + 2, y + 2, x + cellw - 6, y + cellh - 6)
-            if v is None:
-                _rounded(d, box, 10, fill=PALE_ALT, outline="#D7E0E9", width=1)
-                continue
-            color = _interp_color(v / max(mx, 1))
-            _rounded(d, box, 10, fill=color, outline=WHITE, width=2)
-            lum = 0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2]
-            fg = INK if lum > 150 else WHITE
-            _centered_text(d, box, str(v), 28, True, fg)
-
-    d.text((42, H - 78), f"Peak concurrent breaks: {mx}", font=font(22, True), fill=INK)
-    d.text((42, H - 45), "Numbers are the primary indicator; color is a secondary visual aid. Grey cells are outside the allowed break window.", font=font(16), fill=MUTED)
-    return _png_bytes(im)
+    fig, dynamic_height = create_break_overlap_heatmap(
+        payload["schedule"],
+        payload["earliest_dt"],
+        payload["final_dt"],
+        schedule_date=payload["date"],
+        shift_name=payload["shift_label"],
+        power_unit=payload["pu"],
+    )
+    if fig is None:
+        raise ValueError("No valid break window was found for the heatmap")
+    return _render_png(fig, width=1800, height=dynamic_height)
 
 
 def moderator_message(payload, name):
-    rows = sorted([b for b in payload["schedule"] if b["Name"] == name], key=lambda b: b["Start"])
+    rows = sorted((b for b in payload["schedule"] if b["Name"] == name), key=lambda b: b["Start"])
     labels = {"Short": "Short", "Meal": "Meal", "WB20": "Wellness 20", "WB70": "Wellness 70"}
     lines = [
         f"{name} — {payload['date']} · {payload['pu']} · {payload['shift_label']}",
@@ -368,65 +342,112 @@ def moderator_message(payload, name):
         kind = b["Resource"]
         if kind == "Short":
             short_num += 1
-            tag = f"Short {short_num}"
+            label = f"Short {short_num}"
         else:
-            tag = labels[kind]
-        lines.append(f"{tag}: {fmt(b['Start'])}–{fmt(b['Finish'])}")
+            label = labels[kind]
+        lines.append(f"{label}: {fmt(b['Start'])}–{fmt(b['Finish'])}")
     return "\n".join(lines)
 
 
-def generate_individual_card(payload, name):
-    breaks = sorted([b for b in payload["schedule"] if b["Name"] == name], key=lambda b: b["Start"])
-    W, H = 1400, 900
-    im = Image.new("RGB", (W, H), PALE)
-    d = ImageDraw.Draw(im)
-    _rounded(d, (20, 20, W - 20, H - 20), 24, fill=WHITE, outline="#E8EEF4", width=2)
-    d.rectangle((20, 20, W - 20, 172), fill=NAVY)
-    _draw_text_fit(d, (60, 40), name, 1220, start_size=40, min_size=20, bold=True, fill=WHITE)
-    d.text((60, 102), f"{payload['date']}   •   {payload['pu']}   •   {payload['shift_label']}   •   {fmt(payload['shift_start_dt'])}–{fmt(payload['shift_end_dt'])}", font=font(22), fill="#E0EAF2")
-    d.text((60, 208), "MY BREAKS", font=font(30, True), fill=INK)
-    count = 0
-    for idx, b in enumerate(breaks):
-        y = 266 + idx * 110
-        fill = WHITE if idx % 2 == 0 else "#FAFCFE"
-        _rounded(d, (52, y, 1348, y + 90), 16, fill=fill, outline=LINE, width=1)
-        kind = b["Resource"]
-        color = COLORS[kind]
-        _rounded(d, (74, y + 17, 106, y + 73), 10, fill=color)
-        if kind == "Short":
-            count += 1
-            desc = f"Short break {count}"
-        elif kind == "Meal":
-            desc = "Meal break"
-        elif kind == "WB20":
-            desc = "Wellness 20"
+def _individual_figure(payload, name):
+    """Single-person chart in the same original V10 Plotly style (V10 had no cards)."""
+    rows = sorted([b for b in payload["schedule"] if b["Name"] == name], key=lambda b: b["Start"])
+    if not rows:
+        raise ValueError(f"No breaks found for {name}")
+    short_num = 0
+    display = []
+    for b in rows:
+        if b["Resource"] == "Short":
+            short_num += 1
+            label = f"Short {short_num}"
+        elif b["Resource"] == "Meal":
+            label = "Meal"
+        elif b["Resource"] == "WB20":
+            label = "WB20"
         else:
-            desc = "Wellness 70"
-        d.text((132, y + 26), desc, font=font(27, True), fill=INK)
-        timetxt = f"{fmt(b['Start'])} – {fmt(b['Finish'])}"
-        tw, _ = _text_size(d, timetxt, font(28, True))
-        d.text((1300 - tw, y + 26), timetxt, font=font(28, True), fill=INK)
-    d.text((58, H - 46), "Times shown in your local shift timezone · Please follow the latest shared PU schedule", font=font(18), fill=MUTED)
-    return _png_bytes(im)
+            label = "WB70"
+        display.append({
+            "Break": label,
+            "Resource": b["Resource"],
+            "Start": b["Start"],
+            "Finish": b["Finish"],
+            "Bar_Text": f"<b>{fmt(b['Start'])}-{fmt(b['Finish'])}</b>",
+        })
+    df = pd.DataFrame(display)
+    color_map = {
+        "Short": "#3b82f6", "Meal": "#f97316", "WB20": "#22c55e", "WB70": "#a855f7",
+    }
+    fig = px.timeline(
+        df, x_start="Start", x_end="Finish", y="Break", color="Resource", text="Bar_Text",
+        color_discrete_map=color_map,
+    )
+    fig.update_traces(
+        textposition="inside", insidetextanchor="middle", textangle=0,
+        textfont=dict(family="Montserrat, sans-serif", color="white", size=13),
+        marker=dict(line=dict(width=1, color="rgba(255, 255, 255, 0.6)")),
+    )
+    fig.update_yaxes(categoryorder="array", categoryarray=[r["Break"] for r in display])
+    fig.update_layout(
+        title=dict(
+            text=(
+                f"<b>{name} — Break Timetable</b><br>"
+                f"<span style='font-size:14px'>Date: {payload['date']} | "
+                f"Shift: {payload['shift_label']} | Power Unit: {payload['pu']} | "
+                f"{fmt(payload['shift_start_dt'])}–{fmt(payload['shift_end_dt'])}</span>"
+            ),
+            x=0.5, xanchor="center", y=0.94, yanchor="top",
+            font=dict(family="Montserrat, sans-serif", color="black", size=22),
+        ),
+        plot_bgcolor="white", paper_bgcolor="white",
+        font=dict(family="Montserrat, sans-serif", color="black", size=12),
+        xaxis=dict(
+            showgrid=True, gridcolor="#e5e5e5", tickformat="%H:%M", dtick=3600000,
+            title="<b>Time</b>", side="bottom",
+            range=[payload["shift_start_dt"], payload["shift_end_dt"]],
+        ),
+        yaxis=dict(
+            showgrid=True, gridcolor="#f3f4f6", title="", autorange="reversed",
+            tickfont=dict(color="#1c2838", size=12, family="Montserrat, sans-serif"),
+        ),
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.005,
+            xanchor="center", x=0.5, title="",
+        ),
+        margin=dict(l=0, r=0, t=125, b=40),
+        height=560,
+    )
+    return fig
+
+
+def generate_individual_card(payload, name):
+    return _render_png(_individual_figure(payload, name), width=1800, height=560)
 
 
 def generate_cards_zip(payload):
-    buff = BytesIO()
+    buffer = BytesIO()
     names = sorted({b["Name"] for b in payload["schedule"]}, key=str.casefold)
-    with ZipFile(buff, "w", compression=ZIP_DEFLATED) as bundle:
+    with ZipFile(buffer, "w", compression=ZIP_DEFLATED) as archive:
         for i, name in enumerate(names, 1):
-            bundle.writestr(f"Individual_Breaks/{i:03d}_{slug(name)}.png", generate_individual_card(payload, name))
-        bundle.writestr("Moderator_break_summaries.txt", "\n\n".join(moderator_message(payload, name) for name in names).encode("utf-8"))
-    return buff.getvalue()
+            archive.writestr(
+                f"Individual_Breaks/{i:03d}_{slug(name)}.png",
+                generate_individual_card(payload, name),
+            )
+        archive.writestr(
+            "Moderator_break_summaries.txt",
+            "\n\n".join(moderator_message(payload, n) for n in names).encode("utf-8"),
+        )
+    return buffer.getvalue()
 
 
 def generate_csv(payload):
-    out = StringIO()
-    writer = csv.writer(out)
+    buffer = StringIO()
+    writer = csv.writer(buffer)
     writer.writerow(["Date", "PU", "Shift", "Moderator", "Break type", "Start", "End", "Duration minutes", "Ticket moderator"])
     for b in sorted(payload["schedule"], key=lambda x: (x["Name"].casefold(), x["Start"])):
         writer.writerow([
             payload["date"], payload["pu"], payload["shift_label"], b["Name"], b["Resource"],
-            fmt(b["Start"]), fmt(b["Finish"]), int((b["Finish"] - b["Start"]).total_seconds() / 60), bool(b.get("TicketModerator"))
+            fmt(b["Start"]), fmt(b["Finish"]),
+            int((b["Finish"] - b["Start"]).total_seconds() / 60),
+            bool(b.get("TicketModerator")),
         ])
-    return out.getvalue().encode("utf-8-sig")
+    return buffer.getvalue().encode("utf-8-sig")
