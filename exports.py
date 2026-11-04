@@ -7,13 +7,28 @@ from datetime import datetime, timedelta
 from io import BytesIO, StringIO
 from zipfile import ZipFile, ZIP_DEFLATED
 import csv
+import os
 import re
+import shutil
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 
 TIME_STEP=5
+
+# Kaleido v1 uses a locally installed Chrome/Chromium browser to export PNGs.
+# Streamlit Community Cloud installs Chromium from repository-root packages.txt.
+# Explicitly advertise its binary path for Kaleido's browser discovery.
+if not os.environ.get("BROWSER_PATH"):
+    _chromium_binary = (
+        shutil.which("chromium")
+        or shutil.which("chromium-browser")
+        or shutil.which("google-chrome")
+        or shutil.which("google-chrome-stable")
+    )
+    if _chromium_binary:
+        os.environ["BROWSER_PATH"] = _chromium_binary
 
 
 def fmt(dt):
