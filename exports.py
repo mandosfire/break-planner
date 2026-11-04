@@ -55,7 +55,7 @@ def _schedule_to_v10_dataframe(schedule):
         else:
             bar_text = f"<b>{fmt(start)}-{fmt(finish)}</b>"
         result.append({
-            "Task": f"<b>{b['Name']}</b>",
+            "Task": str(b["Name"]),
             "Resource": b["Resource"],
             "Start": start,
             "Finish": finish,
@@ -265,8 +265,14 @@ def create_timetable_figure(
         marker=dict(line=dict(width=1, color="rgba(255, 255, 255, 0.6)")),
     )
 
-    num_moderators = len(sched_df["Task"].unique())
+    # Plotly/Kaleido can clip all y-axis tick labels when margin.l=0.
+    # Use explicit names anchored in a dedicated gutter, rendered as annotations,
+    # rather than relying on auto-margins / category tick labels.
+    moderator_names = sorted(sched_df["Task"].astype(str).unique().tolist(), key=str.casefold)
+    num_moderators = len(moderator_names)
     dynamic_height = max(650, num_moderators * 45 + 210)
+    # Allow enough room even for long names when a chart is exported as a PNG.
+    name_gutter = max(260, min(490, 55 + max((len(n) for n in moderator_names), default=0) * 9))
     date_text = (
         schedule_date.strftime("%Y-%m-%d")
         if hasattr(schedule_date, "strftime")
@@ -302,7 +308,12 @@ def create_timetable_figure(
             showgrid=True,
             gridcolor="#f3f4f6",
             title="",
-            tickfont=dict(color="#1c2838", size=12, family="Montserrat, sans-serif"),
+            # Avoid automatic tick-label clipping across Plotly versions.
+            showticklabels=False,
+            categoryorder="array",
+            categoryarray=moderator_names,
+            autorange="reversed",
+            fixedrange=True,
         ),
         legend=dict(
             orientation="h",
@@ -312,9 +323,26 @@ def create_timetable_figure(
             x=0.5,
             title="",
         ),
-        margin=dict(l=0, r=0, t=125, b=40),
+        margin=dict(l=name_gutter, r=45, t=125, b=55),
         height=dynamic_height,
     )
+
+    # Explicit y/category annotations are stable in both browser Plotly and
+    # Kaleido PNG export. Keeping them inside the reserved left margin also
+    # makes full-length moderator names legible in shared images.
+    for person in moderator_names:
+        fig.add_annotation(
+            x=-0.015,
+            xref="paper",
+            y=person,
+            yref="y",
+            text=f"<b>{person}</b>",
+            showarrow=False,
+            xanchor="right",
+            yanchor="middle",
+            align="right",
+            font=dict(family="Montserrat, sans-serif", size=14, color="#1c2838"),
+        )
     return fig, dynamic_height
 
 
