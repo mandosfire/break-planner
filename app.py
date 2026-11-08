@@ -33,7 +33,7 @@ from optimizer import (
 )
 from exports import (
     generate_timetable_png, generate_heatmap_png, generate_individual_card,
-    generate_cards_zip, generate_csv, moderator_message, name_for,
+    generate_cards_zip, generate_csv, generate_wfm_shift_record_csv, moderator_message, name_for,
 )
 
 st.set_page_config(page_title="Live Break Planner · V11.1", page_icon="🗓️",layout="wide")
@@ -405,7 +405,7 @@ def compute_breaks(selected_date,pu,code,chosen_rows,rule):
             if not patterns:
                 raise ValueError(f"{name}: no feasible five-break layout for this shift, WB setting and inside-time rules. Check fixed WB70, meal window or first-half restriction.")
             profile_cache[profile]=patterns
-        moderators.append({"Name":name,"Counts":counts,"Durations":dur,"TicketModerator":bool(row["Ticket Moderator"]),"Profile":profile})
+        moderators.append({"Name":name,"Email":str(row.get("Email", "") or "").strip().lower(),"Counts":counts,"Durations":dur,"TicketModerator":bool(row["Ticket Moderator"]),"Profile":profile})
     if not moderators:raise ValueError("No moderators are included in the plan.")
     tickets=[m for m in moderators if m["TicketModerator"]]
     if len(tickets)==1:raise ValueError(f"Only one Ticket Moderator is selected ({tickets[0]['Name']}). Mark a second Ticket Moderator or uncheck the first; a single person cannot cover tickets while on break.")
@@ -425,7 +425,7 @@ def compute_breaks(selected_date,pu,code,chosen_rows,rule):
         pattern=pattern_sets[i][result["Chosen"][i]]
         for kind,minutes in zip(pattern["Order"],pattern["Starts"]):
             t=start+timedelta(minutes=int(minutes));finish=t+timedelta(minutes=mod["Durations"][kind])
-            schedule.append({"Name":mod["Name"],"Resource":kind,"Start":t,"Finish":finish,"TicketModerator":mod["TicketModerator"]})
+            schedule.append({"Name":mod["Name"],"Email":mod["Email"],"Resource":kind,"Start":t,"Finish":finish,"TicketModerator":mod["TicketModerator"]})
     # Independent hard-constraint audit before exposing or exporting the schedule.
     for mod in moderators:
         seq=sorted([b for b in schedule if b["Name"]==mod["Name"]],key=lambda b:b["Start"])
@@ -497,6 +497,19 @@ def display_generated(payload):
         display=pd.DataFrame([{"Moderator":b["Name"],"Break":b["Resource"],"Start":b["Start"].strftime("%H:%M"),"End":b["Finish"].strftime("%H:%M"),"Ticket":b["TicketModerator"]} for b in sorted(payload["schedule"],key=lambda x:(x["Name"].casefold(),x["Start"]))])
         st.dataframe(display,width="stretch",hide_index=True)
         st.download_button("Download break times CSV",data=generate_csv(payload),file_name=name_for("Break_Times",payload,"csv"),mime="text/csv")
+    st.markdown("#### WFM planned shift record")
+    st.caption("Full planned shift timeline in WFM's CSV layout: Date, Email, Status, Hours, Start_time, and End_time. Other source-system columns are blank.")
+    try:
+        wfm_csv = generate_wfm_shift_record_csv(payload)
+    except ValueError as exc:
+        st.warning(f"WFM export unavailable: {exc}")
+    else:
+        st.download_button(
+            "Download WFM planned shift record (CSV)",
+            data=wfm_csv,
+            file_name=name_for("WFM_Planned_Shift_Record", payload, "csv"),
+            mime="text/csv",
+        )
     st.markdown("#### Individual moderator communication")
     names=sorted({b["Name"] for b in payload["schedule"]},key=str.casefold)
     chosen=st.selectbox("Find moderator",names,key="individual_moderator")
@@ -626,7 +639,12 @@ def break_planner():
     if st.button("Generate optimized break schedule",type="primary"):
         try:
             with st.spinner("Building feasible break sequences and optimizing overlap..."):
-                payload=compute_breaks(chosen_date,pu,code,edited.to_dict("records"),rule)
+                # Attach verified emails from the published roster, not editable name text.
+                email_by_identity = {person_identity(r): str(r.get("email", "") or "").strip().lower() for r in rows}
+                selection = edited.to_dict("records")
+                for selected in selection:
+                    selected["Email"] = email_by_identity.get(selected["Identity"], "")
+                payload=compute_breaks(chosen_date,pu,code,selection,rule)
                 payload["roster_snapshot_id"]=meta.get("snapshot_id", "")
                 st.session_state["generated_payload"]=payload
                 st.session_state.pop("result_exports",None)
