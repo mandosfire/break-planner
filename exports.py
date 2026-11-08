@@ -494,3 +494,87 @@ def generate_csv(payload):
             bool(b.get("TicketModerator")),
         ])
     return buffer.getvalue().encode("utf-8-sig")
+
+
+# WFM source format: 2 information lines + 16 bilingual columns.
+# Only the six verified fields are filled in the generated plan.
+WFM_SHIFT_RECORD_HEADERS = [
+    "日期/Date", "邮箱/Email", "部门/Department", "状态/Status", "状态详情/Status detail",
+    "自定义备注/Remarks", "时长(h)/Hours(h)", "开始时间/Start_time", "结束时间/End_time",
+    "班次类型/Shift type", "班次/Shift", "班次日期/Shift Date", "任务量/No. of task",
+    "是否为预约日程/Schedule or not", "人员状态是否异常/Inconsistency or not", "是否离职/Resigned or not",
+]
+
+
+def generate_wfm_shift_record_csv(payload):
+    """Export continuous, planned status coverage in the WFM Shift Record CSV format.
+
+    One status segment per interval: Moderation Task between breaks, Rest for
+    Short/Meal, Wellness for WB20/WB70. No actual-work metadata is invented.
+    The Date field follows the local calendar date on which a segment starts,
+    including the day after midnight on Night shifts.
+    """
+    from collections import defaultdict
+    from datetime import datetime
+    from decimal import Decimal
+
+    shift_start = payload["shift_start_dt"]
+    shift_end = payload["shift_end_dt"]
+    if shift_end <= shift_start:
+        raise ValueError("Shift end must be later than shift start.")
+
+    by_name = defaultdict(list)
+    for br in payload["schedule"]:
+        by_name[str(br["Name"])].append(br)
+    if not by_name:
+        raise ValueError("There are no moderator breaks in this plan.")
+
+    rows = []
+    email_owners = {}
+    for name in sorted(by_name, key=str.casefold):
+        breaks = sorted(by_name[name], key=lambda b: b["Start"])
+        emails = {str(b.get("Email", "") or "").strip().lower() for b in breaks}
+        if len(emails) != 1 or not next(iter(emails)) or "@" not in next(iter(emails)):
+            raise ValueError(f"{name}: a valid roster email is required for the WFM export. Correct it in Shift Schedule Management and regenerate.")
+        email = next(iter(emails))
+        if email in email_owners and email_owners[email] != name:
+            raise ValueError(f"Email {email} belongs to multiple moderator names. Correct the roster before exporting.")
+        email_owners[email] = name
+
+        timeline = []
+        cursor = shift_start
+        for br in breaks:
+            start, end = br["Start"], br["Finish"]
+            if start < cursor or end <= start or end > shift_end:
+                raise ValueError(f"{name}: invalid or overlapping breaks; cannot export a continuous timeline.")
+            if start > cursor:
+                timeline.append(("Moderation Task", cursor, start))
+            status = "Rest" if br["Resource"] in ("Short", "Meal") else "Wellness"
+            if br["Resource"] not in ("Short", "Meal", "WB20", "WB70"):
+                raise ValueError(f"{name}: unexpected break type {br['Resource']}.")
+            timeline.append((status, start, end))
+            cursor = end
+        if cursor < shift_end:
+            timeline.append(("Moderation Task", cursor, shift_end))
+
+        if sum((end - start).total_seconds() for _, start, end in timeline) != (shift_end - shift_start).total_seconds():
+            raise RuntimeError(f"{name}: exported timeline does not cover the entire shift.")
+
+        for status, start, end in timeline:
+            duration_hours = Decimal(str((end - start).total_seconds())) / Decimal(3600)
+            row = [""] * len(WFM_SHIFT_RECORD_HEADERS)
+            row[0] = start.strftime("%Y-%m-%d")
+            row[1] = email
+            row[3] = status
+            row[6] = f"{duration_hours:.5f}"
+            row[7] = start.strftime("%Y-%m-%d %H:%M:%S")
+            row[8] = end.strftime("%Y-%m-%d %H:%M:%S")
+            rows.append(row)
+
+    out = StringIO(newline="")
+    writer = csv.writer(out, lineterminator="\r\n")
+    writer.writerow(["TimeZone: UTC+03:00"] + [""] * 15)
+    writer.writerow(["Tips：Export details do not include users with all workhour  data of 0"] + [""] * 15)
+    writer.writerow(WFM_SHIFT_RECORD_HEADERS)
+    writer.writerows(rows)
+    return out.getvalue().encode("utf-8-sig")
