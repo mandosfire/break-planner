@@ -298,10 +298,15 @@ def pattern_vectors(pattern, durations, timeline_mins):
     return active, active_wb70
 
 
-def greedy_fallback(moderators, pattern_sets, vector_sets, timeline_len, pressure_weights):
+def greedy_fallback(moderators, pattern_sets, vector_sets, timeline_len, pressure_weights, ticket_available_counts=None):
     """Produce a complete feasible fallback while honoring the ticket-coverage hard rule."""
     ticket_indices = [i for i, mod in enumerate(moderators) if mod.get("TicketModerator", False)]
     ticket_count = len(ticket_indices)
+    if ticket_available_counts is None:
+        ticket_available_counts = [ticket_count] * timeline_len
+    # During mixed shifts, protection is determined by ticket moderators who
+    # are actually scheduled at each point, not their total headcount.
+    ticket_limits=np.array([max(0,int(n)-1) for n in ticket_available_counts], dtype=float)
     rng = random.Random(99173)
     best_solution = None
     best_score = None
@@ -340,7 +345,7 @@ def greedy_fallback(moderators, pattern_sets, vector_sets, timeline_len, pressur
                 candidate_active = active_mat[:, p_idx]
                 if moderators[m_idx].get("TicketModerator", False) and ticket_count >= 2:
                     candidate_ticket = ticket_active + candidate_active
-                    if np.any(candidate_ticket >= ticket_count - 1e-9):
+                    if np.any(candidate_ticket > ticket_limits + 1e-9):
                         continue
 
                 new_overall = overall + candidate_active
@@ -371,7 +376,7 @@ def greedy_fallback(moderators, pattern_sets, vector_sets, timeline_len, pressur
         if failed or len(chosen) != len(moderators):
             continue
 
-        if ticket_count >= 2 and np.any(ticket_active >= ticket_count - 1e-9):
+        if ticket_count >= 2 and np.any(ticket_active > ticket_limits + 1e-9):
             continue
 
         final_score = (
@@ -391,7 +396,7 @@ def greedy_fallback(moderators, pattern_sets, vector_sets, timeline_len, pressur
         )
     return best_solution
 
-def optimize_pattern_selection(moderators, pattern_sets, vector_sets, timeline_mins, pressure_weights):
+def optimize_pattern_selection(moderators, pattern_sets, vector_sets, timeline_mins, pressure_weights, ticket_available_counts=None):
     """
     Set-partitioning MILP: choose exactly one complete feasible pattern per moderator.
 
@@ -401,6 +406,10 @@ def optimize_pattern_selection(moderators, pattern_sets, vector_sets, timeline_m
     moderator_count = len(moderators)
     timeline_len = len(timeline_mins)
     ticket_count = sum(1 for mod in moderators if mod.get("TicketModerator", False))
+    if ticket_available_counts is None:
+        ticket_available_counts = [ticket_count] * timeline_len
+    if len(ticket_available_counts) != timeline_len:
+        raise ValueError("Ticket availability must match the optimization timeline.")
 
     # One binary variable for every moderator/candidate-pattern pair.
     y_offsets = []
@@ -502,7 +511,7 @@ def optimize_pattern_selection(moderators, pattern_sets, vector_sets, timeline_m
         if ticket_count >= 2:
             rows.append(dict(ticket_terms))
             lbs.append(-np.inf)
-            ubs.append(float(ticket_count - 1))
+            ubs.append(float(max(0, ticket_available_counts[t_idx] - 1)))
 
         row = dict(load_terms)
         for k in range(moderator_count):
@@ -538,7 +547,8 @@ def optimize_pattern_selection(moderators, pattern_sets, vector_sets, timeline_m
 
     if result.x is None:
         chosen, peak, wb_peak = greedy_fallback(
-            moderators, pattern_sets, vector_sets, timeline_len, pressure_weights
+            moderators, pattern_sets, vector_sets, timeline_len, pressure_weights,
+            ticket_available_counts=ticket_available_counts,
         )
         return {
             "Chosen": chosen,
