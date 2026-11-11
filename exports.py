@@ -54,8 +54,11 @@ def _schedule_to_v10_dataframe(schedule):
             bar_text = f"<b>{fmt(start)}<br>{fmt(finish)}</b>"
         else:
             bar_text = f"<b>{fmt(start)}-{fmt(finish)}</b>"
+        display_name = str(b["Name"])
+        if b.get("ShiftCode") in ("0800-1700", "0900-1800"):
+            display_name += f" · {fmt(b['ShiftStart'])}–{fmt(b['ShiftEnd'])}"
         result.append({
-            "Task": str(b["Name"]),
+            "Task": display_name,
             "Resource": b["Resource"],
             "Start": start,
             "Finish": finish,
@@ -377,8 +380,8 @@ def moderator_message(payload, name):
     rows = sorted((b for b in payload["schedule"] if b["Name"] == name), key=lambda b: b["Start"])
     labels = {"Short": "Short", "Meal": "Meal", "WB20": "Wellness 20", "WB70": "Wellness 70"}
     lines = [
-        f"{name} — {payload['date']} · {payload['pu']} · {payload['shift_label']}",
-        f"Shift: {fmt(payload['shift_start_dt'])}–{fmt(payload['shift_end_dt'])}",
+        f"{name} — {payload['date']} · {payload['pu']} · {rows[0].get('ShiftLabel',payload['shift_label']) if rows else payload['shift_label']}",
+        f"Shift: {fmt(rows[0].get('ShiftStart',payload['shift_start_dt']))}–{fmt(rows[0].get('ShiftEnd',payload['shift_end_dt']))}" if rows else "",
     ]
     short_num = 0
     for b in rows:
@@ -435,8 +438,8 @@ def _individual_figure(payload, name):
             text=(
                 f"<b>{name} — Break Timetable</b><br>"
                 f"<span style='font-size:14px'>Date: {payload['date']} | "
-                f"Shift: {payload['shift_label']} | Power Unit: {payload['pu']} | "
-                f"{fmt(payload['shift_start_dt'])}–{fmt(payload['shift_end_dt'])}</span>"
+                f"Shift: {rows[0].get('ShiftLabel',payload['shift_label'])} | Power Unit: {payload['pu']} | "
+                f"{fmt(rows[0].get('ShiftStart',payload['shift_start_dt']))}–{fmt(rows[0].get('ShiftEnd',payload['shift_end_dt']))}</span>"
             ),
             x=0.5, xanchor="center", y=0.94, yanchor="top",
             font=dict(family="Montserrat, sans-serif", color="black", size=22),
@@ -446,7 +449,7 @@ def _individual_figure(payload, name):
         xaxis=dict(
             showgrid=True, gridcolor="#e5e5e5", tickformat="%H:%M", dtick=3600000,
             title="<b>Time</b>", side="bottom",
-            range=[payload["shift_start_dt"], payload["shift_end_dt"]],
+            range=[rows[0].get("ShiftStart",payload["shift_start_dt"]), rows[0].get("ShiftEnd",payload["shift_end_dt"])],
         ),
         yaxis=dict(
             showgrid=True, gridcolor="#f3f4f6", title="", autorange="reversed",
@@ -488,7 +491,7 @@ def generate_csv(payload):
     writer.writerow(["Date", "PU", "Shift", "Moderator", "Break type", "Start", "End", "Duration minutes", "Ticket moderator"])
     for b in sorted(payload["schedule"], key=lambda x: (x["Name"].casefold(), x["Start"])):
         writer.writerow([
-            payload["date"], payload["pu"], payload["shift_label"], b["Name"], b["Resource"],
+            payload["date"], payload["pu"], b.get("ShiftLabel",payload["shift_label"]), b["Name"], b["Resource"],
             fmt(b["Start"]), fmt(b["Finish"]),
             int((b["Finish"] - b["Start"]).total_seconds() / 60),
             bool(b.get("TicketModerator")),
@@ -518,9 +521,7 @@ def generate_wfm_shift_record_csv(payload):
     from datetime import datetime
     from decimal import Decimal
 
-    shift_start = payload["shift_start_dt"]
-    shift_end = payload["shift_end_dt"]
-    if shift_end <= shift_start:
+    if payload["shift_end_dt"] <= payload["shift_start_dt"]:
         raise ValueError("Shift end must be later than shift start.")
 
     by_name = defaultdict(list)
@@ -541,6 +542,16 @@ def generate_wfm_shift_record_csv(payload):
             raise ValueError(f"Email {email} belongs to multiple moderator names. Correct the roster before exporting.")
         email_owners[email] = name
 
+        # A Morning group may contain 07:30, 08:00, and 09:00 starts.
+        # WFM requires each person's *actual* shift coverage, not the union.
+        shift_starts={b.get("ShiftStart",payload["shift_start_dt"]) for b in breaks}
+        shift_ends={b.get("ShiftEnd",payload["shift_end_dt"]) for b in breaks}
+        if len(shift_starts) != 1 or len(shift_ends) != 1:
+            raise ValueError(f"{name}: inconsistent original shift hours across breaks.")
+        shift_start=next(iter(shift_starts))
+        shift_end=next(iter(shift_ends))
+        if shift_end <= shift_start:
+            raise ValueError(f"{name}: invalid shift times.")
         timeline = []
         cursor = shift_start
         for br in breaks:
