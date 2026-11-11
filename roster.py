@@ -102,7 +102,7 @@ def shift_label(code):
     if not parsed:
         return str(code or "")
     a, b = parsed
-    base = "Morning" if a == "07:30" and b == "16:30" else "Mid" if a == "15:00" and b == "00:00" else "Night" if a == "23:30" and b == "08:00" else "Shift"
+    base = "Morning" if (a,b) in (("07:30","16:30"),("08:00","17:00"),("09:00","18:00")) else "Mid" if a == "15:00" and b == "00:00" else "Night" if a == "23:30" and b == "08:00" else "Shift"
     return f"{base} · {a}–{b}"
 
 
