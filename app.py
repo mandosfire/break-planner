@@ -36,7 +36,7 @@ from exports import (
     generate_cards_zip, generate_csv, generate_wfm_shift_record_csv, moderator_message, name_for,
 )
 
-st.set_page_config(page_title="Live Break Planner · V11.1", page_icon="🗓️",layout="wide")
+st.set_page_config(page_title="Live Break Planner · V11.3.6", page_icon="🗓️",layout="wide")
 
 st.markdown("""<style>
 .block-container {padding-top: 1.2rem; max-width: 1700px;}
@@ -319,29 +319,68 @@ def settings_management():
             except Exception as exc:st.error(f"Could not save settings: {exc}")
 
 
-def shift_rule_defaults(selected_date,code):
-    times=parse_shift_code(code)
-    if not times:raise ValueError(f"Invalid shift: {code}")
-    sh,eh=times
-    start=datetime.combine(date.fromisoformat(selected_date),time.fromisoformat(sh))
-    end=datetime.combine(date.fromisoformat(selected_date),time.fromisoformat(eh))
-    if end<=start:end+=timedelta(days=1)
-    canonical=canonical_shift(code)
-    preset="Morning" if canonical=="0730-1630" else "Mid" if canonical=="1500-0000" else "Night" if canonical=="2330-0800" else "Custom"
-    pressure_class=preset
-    if preset=="Custom" and 5<=start.hour<12 and end.hour<=20:pressure_class="Morning"
-    if preset=="Custom" and 14<=start.hour<20:pressure_class="Mid"
-    earliest=start+timedelta(minutes=60)
-    final=end-timedelta(minutes=45)
-    if preset=="Morning":meal_start=start.replace(hour=12,minute=0);meal_end=start.replace(hour=14,minute=30)
-    elif preset=="Mid":meal_start=start.replace(hour=17,minute=0);meal_end=start.replace(hour=21,minute=0)
-    elif preset=="Night":meal_start=start+timedelta(hours=2,minutes=30);meal_end=start+timedelta(hours=5,minutes=30)
-    elif 5<=start.hour<=10:
-        meal_start=start.replace(hour=12,minute=0);meal_end=start.replace(hour=14,minute=30)
-    else:
-        meal_start=start+timedelta(hours=3);meal_end=start+timedelta(hours=6)
-    return {"start":start,"end":end,"earliest":earliest,"final":final,"meal_start":meal_start,"meal_end":meal_end,"preset":preset,"pressure_class":pressure_class}
+# Morning staff on these alternate schedules are optimized together. Individual
+# shift boundaries and exported WFM working intervals are always preserved.
+MORNING_SHIFT_CODES = ("0730-1630", "0800-1700", "0900-1800")
 
+
+def selected_shift_codes(code):
+    return set(MORNING_SHIFT_CODES) if canonical_shift(code) == "0730-1630" else {canonical_shift(code)}
+
+
+def morning_group_label(codes):
+    if len(codes) <= 1:
+        return shift_label(codes[0]) if codes else "Morning"
+    return "Morning (" + ", ".join(
+        f"{parse_shift_code(c)[0]}–{parse_shift_code(c)[1]}" for c in codes
+    ) + ")"
+
+
+def shift_rule_defaults(selected_date, code):
+    times = parse_shift_code(code)
+    if not times:
+        raise ValueError(f"Invalid shift: {code}")
+    sh, eh = times
+    start = datetime.combine(date.fromisoformat(selected_date), time.fromisoformat(sh))
+    end = datetime.combine(date.fromisoformat(selected_date), time.fromisoformat(eh))
+    if end <= start:
+        end += timedelta(days=1)
+    canonical = canonical_shift(code)
+    preset = (
+        "Morning" if canonical in MORNING_SHIFT_CODES else
+        "Mid" if canonical == "1500-0000" else
+        "Night" if canonical == "2330-0800" else "Custom"
+    )
+    pressure_class = preset
+    if preset == "Custom" and 5 <= start.hour < 12 and end.hour <= 20:
+        pressure_class = "Morning"
+    if preset == "Custom" and 14 <= start.hour < 20:
+        pressure_class = "Mid"
+    # Main shifts, including the extra Morning shifts, now all start breaks
+    # after 60 minutes and finish them >=60 minutes before their own shift end.
+    # All rules remain editable at plan time.
+    earliest = start + timedelta(minutes=60)
+    final = end - timedelta(minutes=60 if preset != "Custom" else 45)
+    if preset == "Morning":
+        meal_start = start.replace(hour=12, minute=0)
+        meal_end = start.replace(hour=14, minute=30)
+    elif preset == "Mid":
+        meal_start = start.replace(hour=17, minute=0)
+        meal_end = start.replace(hour=21, minute=0)
+    elif preset == "Night":
+        meal_start = start + timedelta(hours=2, minutes=30)
+        meal_end = start + timedelta(hours=5, minutes=30)
+    elif 5 <= start.hour <= 10:
+        meal_start = start.replace(hour=12, minute=0)
+        meal_end = start.replace(hour=14, minute=30)
+    else:
+        meal_start = start + timedelta(hours=3)
+        meal_end = start + timedelta(hours=6)
+    return {
+        "start": start, "end": end, "earliest": earliest, "final": final,
+        "meal_start": meal_start, "meal_end": meal_end, "preset": preset,
+        "pressure_class": pressure_class,
+    }
 
 def resolve_clock(clock,shift_start):
     try:
@@ -354,104 +393,227 @@ def resolve_clock(clock,shift_start):
         raise ValueError(f"Time '{clock}' is invalid; please use HH:MM.") from exc
 
 
-def compute_breaks(selected_date,pu,code,chosen_rows,rule):
-    """Optimize from the current selected roster, strictly validate all hard constraints."""
-    defaults=shift_rule_defaults(selected_date,code)
-    start=defaults["start"];end=defaults["end"]
-    earliest=resolve_clock(rule["earliest"],start)
-    final=resolve_clock(rule["final"],start)
-    meal_start=resolve_clock(rule["meal_start"],start)
-    meal_end=resolve_clock(rule["meal_end"],start)
-    if not (start<earliest<final<end):raise ValueError("Break-window boundaries must lie strictly inside the shift in chronological order.")
-    if meal_end<=meal_start:raise ValueError("Meal window end must follow its start.")
-    min_gap,max_gap=rule["min_gap"],rule["max_gap"]
-    if not (0<=min_gap<=max_gap):raise ValueError("Minimum inside time cannot exceed maximum inside time.")
-    if int((end-start).total_seconds()/60)>780:raise ValueError("Shifts longer than 13 hours are not supported.")
-    total=int((end-start).total_seconds()/60)
-    if total%5:raise ValueError("Shift duration must be divisible into 5-minute intervals.")
-    moderators=[];profile_cache={}
-    active_count=sum(bool(row.get("Include",False)) for row in chosen_rows)
-    candidate_cap=min(300,max(90,3600//max(1,active_count)))
-    for row in chosen_rows:
-        if not bool(row["Include"]):continue
-        name=str(row["Name"])
-        wb70=bool(row["WB70"])
-        counts={"Short":3,"Meal":1,"WB20":0 if wb70 else 1,"WB70":1 if wb70 else 0}
-        dur=dict(rule["durations"])
-        custom_duration=str(row.get("WB70 Duration (mins)", "") or "").strip()
+def compute_breaks(selected_date, pu, code, chosen_rows, rule):
+    """Optimize actual (potentially mixed) shift hours with shared PU coverage.
+
+    Morning (07:30–16:30, 08:00–17:00, 09:00–18:00) runs one global
+    optimization on a shared wall-clock axis. Each person keeps their own
+    9-hour shift, first/last-break bounds and complete WFM shift timeline.
+    """
+    defaults = shift_rule_defaults(selected_date, code)
+    anchor_start = defaults["start"]
+    anchor_end = defaults["end"]
+    common_earliest = resolve_clock(rule["earliest"], anchor_start)
+    common_final = resolve_clock(rule["final"], anchor_start)
+    meal_start = resolve_clock(rule["meal_start"], anchor_start)
+    meal_end = resolve_clock(rule["meal_end"], anchor_start)
+    if meal_end <= meal_start:
+        raise ValueError("Meal window end must follow its start.")
+    if not (anchor_start < common_earliest < common_final < anchor_end):
+        raise ValueError("Break-window boundaries must lie strictly inside the shift in chronological order.")
+    min_gap, max_gap = int(rule["min_gap"]), int(rule["max_gap"])
+    if not (0 <= min_gap <= max_gap):
+        raise ValueError("Minimum inside time cannot exceed maximum inside time.")
+
+    chosen = [row for row in chosen_rows if bool(row.get("Include", False))]
+    if not chosen:
+        raise ValueError("No moderators are included in the plan.")
+    allowed = selected_shift_codes(code)
+    selected_is_morning = canonical_shift(code) == "0730-1630"
+    mod_shift_info = []
+    for row in chosen:
+        actual_code = canonical_shift(row.get("ShiftCode") or code)
+        if actual_code not in allowed:
+            raise ValueError(f"{row['Name']}: shift {actual_code} is not included in the selected shift group.")
+        actual_defaults = shift_rule_defaults(selected_date, actual_code)
+        person_start, person_end = actual_defaults["start"], actual_defaults["end"]
+        if person_end - person_start > timedelta(hours=13):
+            raise ValueError(f"{row['Name']}: shifts longer than 13 hours are not supported.")
+        if int((person_end - person_start).total_seconds() / 60) % TIME_STEP:
+            raise ValueError(f"{row['Name']}: shift must use five-minute boundaries.")
+        # For alternate Morning starts, shift the *earliest* and *latest* time
+        # controls relative to the 07:30–16:30 base shift. This keeps the
+        # selected Morning rules customizable while maintaining 60–90 minute
+        # inside constraints for a 09:00–18:00 moderator.
+        delta = (person_start - anchor_start) if selected_is_morning else timedelta(0)
+        person_earliest = common_earliest + delta
+        person_final = common_final + delta
+        if not (person_start < person_earliest < person_final < person_end):
+            raise ValueError(f"{row['Name']}: custom break window falls outside their actual {actual_code} shift.")
+        mod_shift_info.append({
+            "row": row, "code": actual_code, "start": person_start, "end": person_end,
+            "earliest": person_earliest, "final": person_final,
+        })
+
+    start = min(m["start"] for m in mod_shift_info)
+    end = max(m["end"] for m in mod_shift_info)
+    total = int((end - start).total_seconds() / 60)
+    if total % TIME_STEP:
+        raise ValueError("Combined shift timeline must use five-minute boundaries.")
+
+    candidate_cap = min(300, max(90, 3600 // len(chosen)))
+    moderators = []
+    profile_cache = {}
+    for item in mod_shift_info:
+        row = item["row"]
+        name = str(row["Name"])
+        wb70 = bool(row["WB70"])
+        counts = {"Short": 3, "Meal": 1, "WB20": 0 if wb70 else 1, "WB70": 1 if wb70 else 0}
+        dur = dict(rule["durations"])
+        custom_duration = str(row.get("WB70 Duration (mins)", "") or "").strip()
         if wb70 and custom_duration:
-            if not custom_duration.isdigit() or int(custom_duration)%5 or int(custom_duration)<5:
+            if not custom_duration.isdigit() or int(custom_duration) % TIME_STEP or int(custom_duration) < TIME_STEP:
                 raise ValueError(f"{name}: WB70 duration must be a positive multiple of 5 minutes.")
-            dur["WB70"]=int(custom_duration)
-        fixed_clock=str(row.get("Fixed WB70 Start", "") or "").strip()
-        if fixed_clock and not wb70:raise ValueError(f"{name}: Fixed WB70 requires WB70 checkbox to be checked.")
-        fixed_mins=None
+            dur["WB70"] = int(custom_duration)
+        fixed_clock = str(row.get("Fixed WB70 Start", "") or "").strip()
+        if fixed_clock and not wb70:
+            raise ValueError(f"{name}: Fixed WB70 requires WB70 checkbox to be checked.")
+        fixed_mins = None
         if fixed_clock:
-            fixed_dt=resolve_clock(fixed_clock,start)
-            fixed_mins=int((fixed_dt-start).total_seconds()/60)
-            if fixed_mins%5:raise ValueError(f"{name}: Fixed WB70 must be on a five-minute boundary.")
-        profile=(tuple((b,counts[b]) for b in BREAK_TYPES),tuple((b,dur[b]) for b in BREAK_TYPES),fixed_mins,bool(rule["allow_wb70_second_half"]))
+            fixed_dt = resolve_clock(fixed_clock, item["start"])
+            fixed_mins = int((fixed_dt - item["start"]).total_seconds() / 60)
+            if fixed_mins % TIME_STEP:
+                raise ValueError(f"{name}: Fixed WB70 must be on a five-minute boundary.")
+        person_start = item["start"]
+        person_end = item["end"]
+        profile = (
+            tuple((b, counts[b]) for b in BREAK_TYPES),
+            tuple((b, dur[b]) for b in BREAK_TYPES),
+            int((person_end - person_start).total_seconds() / 60),
+            int((item["earliest"] - person_start).total_seconds() / 60),
+            int((item["final"] - person_start).total_seconds() / 60),
+            int((meal_start - person_start).total_seconds() / 60),
+            int((meal_end - person_start).total_seconds() / 60),
+            fixed_mins, bool(rule["allow_wb70_second_half"]),
+        )
         if profile not in profile_cache:
-            patterns=build_candidate_patterns(
-                counts=counts,durations=dur,total_shift_mins=total,
-                earliest_mins=int((earliest-start).total_seconds()/60),
-                final_mins=int((final-start).total_seconds()/60),
-                meal_start_mins=int((meal_start-start).total_seconds()/60),
-                meal_end_mins=int((meal_end-start).total_seconds()/60),
-                min_inside=min_gap,max_inside=max_gap,fixed_wb70_mins=fixed_mins,
+            patterns = build_candidate_patterns(
+                counts=counts, durations=dur,
+                total_shift_mins=profile[2], earliest_mins=profile[3],
+                final_mins=profile[4], meal_start_mins=profile[5],
+                meal_end_mins=profile[6], min_inside=min_gap, max_inside=max_gap,
+                fixed_wb70_mins=fixed_mins,
                 allow_wb70_second_half=bool(rule["allow_wb70_second_half"]),
                 max_patterns=candidate_cap,
             )
             if not patterns:
-                raise ValueError(f"{name}: no feasible five-break layout for this shift, WB setting and inside-time rules. Check fixed WB70, meal window or first-half restriction.")
-            profile_cache[profile]=patterns
-        moderators.append({"Name":name,"Email":str(row.get("Email", "") or "").strip().lower(),"Counts":counts,"Durations":dur,"TicketModerator":bool(row["Ticket Moderator"]),"Profile":profile})
-    if not moderators:raise ValueError("No moderators are included in the plan.")
-    tickets=[m for m in moderators if m["TicketModerator"]]
-    if len(tickets)==1:raise ValueError(f"Only one Ticket Moderator is selected ({tickets[0]['Name']}). Mark a second Ticket Moderator or uncheck the first; a single person cannot cover tickets while on break.")
-    timeline=list(range(0,total+1,TIME_STEP))
-    weights=build_pressure_profile(defaults["pressure_class"],start,timeline)["Weight"]
-    pattern_sets=[];vector_sets=[];vector_cache={}
-    for mod in moderators:
-        patterns=profile_cache[mod["Profile"]]
-        pattern_sets.append(patterns)
-        if mod["Profile"] not in vector_cache:
-            cols=[pattern_vectors(p,mod["Durations"],timeline) for p in patterns]
-            vector_cache[mod["Profile"]]=(np.stack([a for a,w in cols],axis=1),np.stack([w for a,w in cols],axis=1))
-        vector_sets.append(vector_cache[mod["Profile"]])
-    result=optimize_pattern_selection(moderators,pattern_sets,vector_sets,timeline,weights)
-    schedule=[]
-    for i,mod in enumerate(moderators):
-        pattern=pattern_sets[i][result["Chosen"][i]]
-        for kind,minutes in zip(pattern["Order"],pattern["Starts"]):
-            t=start+timedelta(minutes=int(minutes));finish=t+timedelta(minutes=mod["Durations"][kind])
-            schedule.append({"Name":mod["Name"],"Email":mod["Email"],"Resource":kind,"Start":t,"Finish":finish,"TicketModerator":mod["TicketModerator"]})
-    # Independent hard-constraint audit before exposing or exporting the schedule.
-    for mod in moderators:
-        seq=sorted([b for b in schedule if b["Name"]==mod["Name"]],key=lambda b:b["Start"])
-        if len(seq)!=5 or Counter(b["Resource"] for b in seq)!={k:v for k,v in mod["Counts"].items() if v}:
-            raise RuntimeError(f"Internal entitlement-validation error for {mod['Name']}")
-        if seq[0]["Resource"]=="Meal":raise RuntimeError(f"Meal-first violation for {mod['Name']}")
-        times=[(start,seq[0]["Start"]),(seq[-1]["Finish"],end)]+[(a["Finish"],b["Start"]) for a,b in zip(seq,seq[1:])]
-        for a,b in times:
-            gap=(b-a).total_seconds()/60
-            if gap<min_gap-0.01 or gap>max_gap+0.01:raise RuntimeError(f"Inside-gap validation failure for {mod['Name']}")
-    if len(tickets)>=2:
-        ticket_names={m["Name"] for m in tickets}
-        for t in timeline:
-            now=start+timedelta(minutes=t)
-            if sum(b["Name"] in ticket_names and b["Start"]<=now<b["Finish"] for b in schedule)>=len(tickets):
-                raise RuntimeError("Internal Ticket Moderator coverage validation failed")
-    return {
-        "date":selected_date,"pu":pu,"shift_code":canonical_shift(code),"shift_label":shift_label(code),
-        "shift_start_dt":start,"shift_end_dt":end,"earliest_dt":earliest,"final_dt":final,
-        "schedule":schedule,"peak_concurrent":max(sum(b["Start"]<=start+timedelta(minutes=t)<b["Finish"] for b in schedule) for t in timeline),
-        "peak_wb70":max(sum(b["Resource"]=="WB70" and b["Start"]<=start+timedelta(minutes=t)<b["Finish"] for b in schedule) for t in timeline),
-        "tickets":len(tickets),"used_fallback":bool(result["UsedFallback"]),"allow_wb70_second_half":bool(rule["allow_wb70_second_half"]),
-        "generated_at":datetime.now().isoformat(timespec="seconds"),
-        "pressure_summary":pd.DataFrame({"Time":[start+timedelta(minutes=t) for t in timeline],"Pressure Weight":weights}),
-    }
+                raise ValueError(
+                    f"{name} ({item['code']}): no feasible five-break layout for "
+                    "this shift and rules. Check WB70, meal window and timing limits."
+                )
+            profile_cache[profile] = patterns
+        moderators.append({
+            "Name": name, "Email": str(row.get("Email", "") or "").strip().lower(),
+            "Counts": counts, "Durations": dur,
+            "TicketModerator": bool(row["Ticket Moderator"]),
+            "Profile": profile, "ShiftCode": item["code"],
+            "ShiftStart": person_start, "ShiftEnd": person_end,
+            "Earliest": item["earliest"], "Final": item["final"],
+        })
 
+    tickets = [m for m in moderators if m["TicketModerator"]]
+    if len(tickets) == 1:
+        raise ValueError(
+            f"Only one Ticket Moderator is selected ({tickets[0]['Name']}). "
+            "Mark a second Ticket Moderator or uncheck the first."
+        )
+
+    timeline = list(range(0, total + 1, TIME_STEP))
+    weights = build_pressure_profile(defaults["pressure_class"], start, timeline)["Weight"]
+    pattern_sets, vector_sets = [], []
+    vector_cache = {}
+    for mod in moderators:
+        patterns = profile_cache[mod["Profile"]]
+        pattern_sets.append(patterns)
+        offset = int((mod["ShiftStart"] - start).total_seconds() / 60)
+        vector_key = (mod["Profile"], offset)
+        if vector_key not in vector_cache:
+            cols = []
+            for pattern in patterns:
+                absolute_pattern = {
+                    "Order": pattern["Order"],
+                    "Starts": tuple(int(m) + offset for m in pattern["Starts"]),
+                }
+                cols.append(pattern_vectors(absolute_pattern, mod["Durations"], timeline))
+            vector_cache[vector_key] = (
+                np.stack([a for a, w in cols], axis=1),
+                np.stack([w for a, w in cols], axis=1),
+            )
+        vector_sets.append(vector_cache[vector_key])
+
+    ticket_availability = [
+        sum(m["ShiftStart"] <= start + timedelta(minutes=t) < m["ShiftEnd"] for m in tickets)
+        for t in timeline
+    ]
+    result = optimize_pattern_selection(
+        moderators, pattern_sets, vector_sets, timeline, weights,
+        ticket_available_counts=ticket_availability,
+    )
+    schedule = []
+    for i, mod in enumerate(moderators):
+        pattern = pattern_sets[i][result["Chosen"][i]]
+        for kind, minutes in zip(pattern["Order"], pattern["Starts"]):
+            t = mod["ShiftStart"] + timedelta(minutes=int(minutes))
+            finish = t + timedelta(minutes=mod["Durations"][kind])
+            schedule.append({
+                "Name": mod["Name"], "Email": mod["Email"], "Resource": kind,
+                "Start": t, "Finish": finish, "TicketModerator": mod["TicketModerator"],
+                "ShiftCode": mod["ShiftCode"], "ShiftStart": mod["ShiftStart"],
+                "ShiftEnd": mod["ShiftEnd"], "ShiftLabel": shift_label(mod["ShiftCode"]),
+            })
+
+    # Audit every individual schedule against its actual working hours.
+    for mod in moderators:
+        seq = sorted([b for b in schedule if b["Name"] == mod["Name"]], key=lambda b: b["Start"])
+        if len(seq) != 5 or Counter(b["Resource"] for b in seq) != {k: v for k, v in mod["Counts"].items() if v}:
+            raise RuntimeError(f"Entitlement-validation error for {mod['Name']}")
+        if seq[0]["Resource"] == "Meal":
+            raise RuntimeError(f"Meal-first violation for {mod['Name']}")
+        gap_pairs = (
+            [(mod["ShiftStart"], seq[0]["Start"]), (seq[-1]["Finish"], mod["ShiftEnd"])]
+            + [(a["Finish"], b["Start"]) for a, b in zip(seq, seq[1:])]
+        )
+        for a, b in gap_pairs:
+            gap = (b - a).total_seconds() / 60
+            if gap < min_gap - 0.01 or gap > max_gap + 0.01:
+                raise RuntimeError(f"Inside-gap validation failure for {mod['Name']}")
+        if seq[0]["Start"] < mod["Earliest"] or seq[-1]["Finish"] > mod["Final"]:
+            raise RuntimeError(f"Break-window validation failure for {mod['Name']}")
+
+    if len(tickets) >= 2:
+        ticket_names = {m["Name"] for m in tickets}
+        for minute in timeline:
+            now = start + timedelta(minutes=minute)
+            available = sum(m["ShiftStart"] <= now < m["ShiftEnd"] for m in tickets)
+            on_break = sum(b["Name"] in ticket_names and b["Start"] <= now < b["Finish"] for b in schedule)
+            if available and on_break >= available:
+                raise RuntimeError("Ticket Moderator coverage validation failed")
+
+    all_codes = sorted({m["ShiftCode"] for m in moderators})
+    label = morning_group_label(all_codes) if selected_is_morning else shift_label(code)
+    return {
+        "date": selected_date, "pu": pu, "shift_code": canonical_shift(code),
+        "shift_label": label,
+        "shift_start_dt": start, "shift_end_dt": end,
+        "earliest_dt": min(m["Earliest"] for m in moderators),
+        "final_dt": max(m["Final"] for m in moderators),
+        "schedule": schedule,
+        "peak_concurrent": max(
+            sum(b["Start"] <= start + timedelta(minutes=t) < b["Finish"] for b in schedule)
+            for t in timeline
+        ),
+        "peak_wb70": max(
+            sum(b["Resource"] == "WB70" and b["Start"] <= start + timedelta(minutes=t) < b["Finish"] for b in schedule)
+            for t in timeline
+        ),
+        "tickets": len(tickets), "used_fallback": bool(result["UsedFallback"]),
+        "allow_wb70_second_half": bool(rule["allow_wb70_second_half"]),
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "pressure_summary": pd.DataFrame({
+            "Time": [start + timedelta(minutes=t) for t in timeline],
+            "Pressure Weight": weights,
+        }),
+    }
 
 def display_generated(payload):
     st.markdown("### Generated break schedule")
@@ -585,18 +747,36 @@ def break_planner():
     if not pu:
         st.info("No Power Units available for the selected date.")
         return
-    shift_counts=Counter(canonical_shift(r["shift_code"]) for r in roster if r["date"]==chosen_date and r["pu"]==pu and parse_shift_code(r["shift_code"]))
-    shifts=sorted([code for code in shift_counts if code],key=lambda x:x[:4])
-    with cols[2]:code=st.selectbox("Scheduled shift",shifts,format_func=lambda c:f"{shift_label(c)} ({shift_counts[c]} moderators)",key="planner_shift") if shifts else None
+    raw_shift_counts=Counter(canonical_shift(r["shift_code"]) for r in roster if r["date"]==chosen_date and r["pu"]==pu and parse_shift_code(r["shift_code"]))
+    shift_counts=Counter(raw_shift_counts)
+    morning_total=sum(raw_shift_counts[c] for c in MORNING_SHIFT_CODES)
+    if morning_total:
+        for c in MORNING_SHIFT_CODES:
+            shift_counts.pop(c, None)
+        shift_counts["0730-1630"]=morning_total
+    shifts=sorted([c for c in shift_counts if c],key=lambda c:c[:4])
+    def shift_option_label(c):
+        if c=="0730-1630":
+            return f"Morning · includes 07:30, 08:00 & 09:00 starts ({shift_counts[c]} moderators)"
+        return f"{shift_label(c)} ({shift_counts[c]} moderators)"
+    with cols[2]:code=st.selectbox("Scheduled shift",shifts,format_func=shift_option_label,key="planner_shift") if shifts else None
     if not code:
         st.warning("No timed shifts found for this selected date and Power Unit. Check the roster status codes.")
         return
-    conflicting=affected_conflicts(roster,chosen_date,pu,code)
+    applicable_codes = selected_shift_codes(code)
+    conflicting=[]
+    conflict_keys=set()
+    for selected_code in applicable_codes:
+        for issue in affected_conflicts(roster,chosen_date,pu,selected_code):
+            key=(issue.get("Date"), issue.get("Moderator"), issue.get("Issue"))
+            if key not in conflict_keys:
+                conflict_keys.add(key)
+                conflicting.append(issue)
     if conflicting:
         st.error("ROSTER CONFLICT — This shift contains an active moderator also assigned to another PU or twice in the same PU on this date. Fix the highlighted assignments in Shift Schedule Management before generating.")
         st.dataframe(pd.DataFrame(conflicting),width="stretch",hide_index=True)
         return
-    rows=[r for r in roster if r["date"]==chosen_date and r["pu"]==pu and canonical_shift(r["shift_code"])==code]
+    rows=[r for r in roster if r["date"]==chosen_date and r["pu"]==pu and canonical_shift(r["shift_code"]) in applicable_codes]
     try:saved=cached_settings()
     except Exception as exc:
         st.warning(f"Moderator defaults could not load; using WB20/ticket-off defaults: {exc}")
@@ -604,10 +784,13 @@ def break_planner():
     choices=[]
     for r in sorted(rows,key=lambda x:x["name"].casefold()):
         opts=saved.get((pu,person_identity(r)),{})
-        choices.append({"Name":r["name"],"Include":True,"WB70":bool(opts.get("wb70",False)),"Ticket Moderator":bool(opts.get("ticket",False)),"Fixed WB70 Start":str(opts.get("fixed_wb70", "") or ""),"WB70 Duration (mins)":str(opts.get("wb70_duration", "") or ""),"Identity":person_identity(r)})
-    st.markdown(f"### {len(choices)} moderators · {pu} · {shift_label(code)}")
+        choices.append({"Name":r["name"],"ShiftCode":canonical_shift(r["shift_code"]),"Shift":shift_label(r["shift_code"]),"Include":True,"WB70":bool(opts.get("wb70",False)),"Ticket Moderator":bool(opts.get("ticket",False)),"Fixed WB70 Start":str(opts.get("fixed_wb70", "") or ""),"WB70 Duration (mins)":str(opts.get("wb70_duration", "") or ""),"Identity":person_identity(r)})
+    st.markdown(f"### {len(choices)} moderators · {pu} · {shift_option_label(code)}")
+    if code=="0730-1630":
+        details=", ".join(f"{shift_label(c)}: {raw_shift_counts[c]}" for c in MORNING_SHIFT_CODES if raw_shift_counts[c])
+        st.caption(f"Morning group shift composition — {details}. All staff are optimized together, but each retains their actual shift hours.")
     st.caption("Automatic entitlements for every included moderator: 3 Shorts, 1 Meal, 1 Wellness. Check WB70 for 70-minute wellness; unchecked means WB20. Ticket coverage never allows all checked ticket moderators to be on break together. Use Include to exclude a temporary absence without changing the shared roster.")
-    edited=st.data_editor(pd.DataFrame(choices),width="stretch",hide_index=True,disabled=["Name","Identity"],num_rows="fixed",column_config={"Identity":None,"Include":st.column_config.CheckboxColumn("Include"),"WB70":st.column_config.CheckboxColumn("WB70?"),"Ticket Moderator":st.column_config.CheckboxColumn("Ticket?"),"Fixed WB70 Start":st.column_config.TextColumn("Fixed WB70 HH:MM"),"WB70 Duration (mins)":st.column_config.TextColumn("WB70 duration (optional)")},key=f"plan_edit_{chosen_date}_{pu}_{code}_{meta.get('snapshot_id','')}")
+    edited=st.data_editor(pd.DataFrame(choices),width="stretch",hide_index=True,disabled=["Name","Identity","ShiftCode","Shift"],num_rows="fixed",column_config={"Identity":None,"ShiftCode":None,"Include":st.column_config.CheckboxColumn("Include"),"WB70":st.column_config.CheckboxColumn("WB70?"),"Ticket Moderator":st.column_config.CheckboxColumn("Ticket?"),"Fixed WB70 Start":st.column_config.TextColumn("Fixed WB70 HH:MM"),"WB70 Duration (mins)":st.column_config.TextColumn("WB70 duration (optional)")},key=f"plan_edit_{chosen_date}_{pu}_{code}_{meta.get('snapshot_id','')}")
     if st.button("Save these WB70/Ticket choices as permanent PU defaults"):
         updates=[{"identity":r["Identity"],"name":r["Name"],"wb70":bool(r["WB70"]),"ticket":bool(r["Ticket Moderator"]),"wb70_duration":str(r["WB70 Duration (mins)" ] or ""),"fixed_wb70":str(r["Fixed WB70 Start"] or "")} for _,r in edited.iterrows()]
         try:
@@ -617,13 +800,13 @@ def break_planner():
     defaults=shift_rule_defaults(chosen_date,code)
     st.markdown("### Break rules")
     with st.expander("Shift-specific timing, durations and optimization rules",expanded=True):
-        st.caption("Timing defaults are derived from the actual imported shift (including 08:00–17:00, 09:00–18:00, 11:00–20:00, and overnight shifts). They may be adjusted for the selected plan.")
+        st.caption("Defaults can be customized for this plan. In the Morning group, 08:00–17:00 and 09:00–18:00 staff use their own start/end times; earliest and latest break limits shift accordingly. Meal hours remain at the selected clock times.")
         a,b,c,d=st.columns(4)
         with a:
-            earliest=st.text_input("Earliest break allowed",defaults["earliest"].strftime("%H:%M"),key=f"early_{code}")
+            earliest=st.text_input("Earliest break allowed",defaults["earliest"].strftime("%H:%M"),key=f"early_rules_v2_{code}")
             dur_short=st.number_input("Short length (min)",5,90,15,5,key=f"dshort_{code}")
         with b:
-            final=st.text_input("Final break must end by",defaults["final"].strftime("%H:%M"),key=f"final_{code}")
+            final=st.text_input("Final break must end by",defaults["final"].strftime("%H:%M"),key=f"final_rules_v2_{code}")
             dur_meal=st.number_input("Meal length (min)",5,90,30,5,key=f"dmeal_{code}")
         with c:
             meal_start=st.text_input("Meal window start",defaults["meal_start"].strftime("%H:%M"),key=f"mstart_{code}")
@@ -632,8 +815,8 @@ def break_planner():
             meal_end=st.text_input("Meal window end",defaults["meal_end"].strftime("%H:%M"),key=f"mend_{code}")
             dur_wb70=st.number_input("WB70 length (min)",5,150,70,5,key=f"dwb70_{code}")
         c1,c2,c3=st.columns(3)
-        with c1:min_gap=st.number_input("Minimum inside time (min)",0,180,45,5,key=f"mingap_{code}")
-        with c2:max_gap=st.number_input("Maximum inside time (min)",0,240,105,5,key=f"maxgap_{code}")
+        with c1:min_gap=st.number_input("Minimum inside time (min)",0,180,(60 if defaults["preset"]!="Custom" else 45),5,key=f"mingap_rules_v2_{code}")
+        with c2:max_gap=st.number_input("Maximum inside time (min)",0,240,(90 if defaults["preset"]!="Custom" else 105),5,key=f"maxgap_rules_v2_{code}")
         with c3:allow_second=st.toggle("Allow WB70 in second half",value=False,key=f"wb_second_{code}",help="When OFF, non-fixed WB70 must finish by the shift midpoint. Fixed WB70 starts always override only this restriction.")
     rule={"earliest":earliest,"final":final,"meal_start":meal_start,"meal_end":meal_end,"min_gap":int(min_gap),"max_gap":int(max_gap),"allow_wb70_second_half":bool(allow_second),"durations":{"Short":int(dur_short),"Meal":int(dur_meal),"WB20":int(dur_wb20),"WB70":int(dur_wb70)}}
     if st.button("Generate optimized break schedule",type="primary"):
