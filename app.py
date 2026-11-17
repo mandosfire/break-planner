@@ -22,10 +22,14 @@ import streamlit as st
 
 from roster import (
     FLOOR_DATE, PUS, PU_SHEETS, ROSTER_HEADERS,
-    affected_conflicts, canonical_shift, connection_check, load_moderator_settings,
+    affected_conflicts, canonical_shift, connection_check,
     load_roster, normalize_name, parse_shift_code, parse_workbook,
     person_identity, publish_roster, read_excel_date, restore_roster_version,
-    shift_label, upsert_moderator_settings, validate_roster, list_roster_versions,
+    shift_label, validate_roster, list_roster_versions,
+)
+from wb70 import (
+    parse_wb70_workbook, load_wb70_plan, publish_wb70_plan,
+    list_wb70_versions, restore_wb70_version, match_wb70,
 )
 from optimizer import (
     BREAK_TYPES, TIME_STEP, build_candidate_patterns, build_pressure_profile,
@@ -36,7 +40,7 @@ from exports import (
     generate_cards_zip, generate_csv, generate_wfm_shift_record_csv, moderator_message, name_for,
 )
 
-st.set_page_config(page_title="Live Break Planner · V11.3.6", page_icon="🗓️",layout="wide")
+st.set_page_config(page_title="Live Break Planner · V11.4.1", page_icon="🗓️",layout="wide")
 
 st.markdown("""<style>
 .block-container {padding-top: 1.2rem; max-width: 1700px;}
@@ -67,7 +71,7 @@ def access_gate():
 access_gate()
 
 st.sidebar.title("LIVE BREAK PLANNER")
-page=st.sidebar.radio("Workspace",["Break Planner","Shift Schedule Management","Moderator Settings","Storage & Help"],index=0)
+page=st.sidebar.radio("Workspace",["Break Planner","Shift Schedule Management","Weekly WB70 Upload","Storage & Help"],index=0)
 st.sidebar.caption("Roster-driven · Break plans are never uploaded to the site")
 
 
@@ -76,8 +80,8 @@ def cached_roster():
     return load_roster()
 
 @st.cache_data(ttl=45,show_spinner=False)
-def cached_settings():
-    return load_moderator_settings()
+def cached_wb70():
+    return load_wb70_plan()
 
 
 def load_remote_or_error():
@@ -91,7 +95,7 @@ def load_remote_or_error():
 
 def purge_caches():
     cached_roster.clear()
-    cached_settings.clear()
+    cached_wb70.clear()
 
 
 def apply_draft_subset(all_rows,original_subset,edited):
@@ -279,44 +283,71 @@ def schedule_management():
             except Exception as exc:st.error(f"Cannot load revisions: {exc}")
 
 
-def settings_management():
-    st.title("Persistent Moderator Settings")
-    st.caption("Remember WB70 and Ticket Moderator defaults across future uploads. Break preparation can override these settings for a single shift without changing the saved defaults.")
-    roster,meta=load_remote_or_error()
-    if not roster:return
-    try: saved=cached_settings()
+def weekly_wb70_management():
+    st.title("Weekly WB70 Upload")
+    st.caption("Upload the weekly WB70 workbook once for all planners. Names are matched against the published shift roster at planning time. Uploaded assignments are stored in versioned Google Sheets snapshots, not as generated break schedules.")
+    try:
+        current, meta = cached_wb70()
     except Exception as exc:
-        st.error(f"Cannot load moderator settings: {exc}")
+        st.error(f"Cannot load shared WB70 assignments: {exc}")
         return
-    pu=st.selectbox("Power Unit",PUS,key="settings_pu")
-    # Include all recognized staff in this PU, including staff who are OFF today.
-    unique={}
-    for r in roster:
-        if r["pu"]!=pu:continue
-        identity=person_identity(r)
-        if identity and r["name"]:unique[identity]=r["name"]
-    data=[]
-    for identity,name in sorted(unique.items(),key=lambda t:t[1].casefold()):
-        opts=saved.get((pu,identity),{})
-        data.append({"Identity":identity,"Name":name,"WB70":bool(opts.get("wb70",False)),"Ticket Moderator":bool(opts.get("ticket",False)),"WB70 Duration":opts.get("wb70_duration", ""),"Fixed WB70 Start":opts.get("fixed_wb70", "")})
-    st.caption(f"{len(data)} moderators found for {pu}. Unchecked WB70 means WB20. Duration/fixed start fields are optional.")
-    with st.form("settings_form"):
-        edited=st.data_editor(pd.DataFrame(data),width="stretch",hide_index=True,disabled=["Identity","Name"],column_config={"Identity":None,"WB70":st.column_config.CheckboxColumn("WB70?"),"Ticket Moderator":st.column_config.CheckboxColumn("Ticket?"),"WB70 Duration":st.column_config.TextColumn("WB70 duration (mins)"),"Fixed WB70 Start":st.column_config.TextColumn("Fixed WB70 start HH:MM")},key="settings_editor_"+pu)
-        save=st.form_submit_button("Save defaults for this Power Unit",type="primary")
-    if save:
-        records=[];errors=[]
-        for _,r in edited.iterrows():
-            duration=str(r["WB70 Duration"] or "").strip()
-            fixed=str(r["Fixed WB70 Start"] or "").strip()
-            if duration and (not duration.isdigit() or int(duration)<5 or int(duration)%5!=0):errors.append(f"{r['Name']}: duration must be a positive 5-minute multiple")
-            if fixed and not re.fullmatch(r"\d{1,2}:\d{2}",fixed):errors.append(f"{r['Name']}: fixed time must be HH:MM")
-            records.append({"identity":r["Identity"],"name":r["Name"],"wb70":bool(r["WB70"]),"ticket":bool(r["Ticket Moderator"]),"wb70_duration":duration,"fixed_wb70":fixed})
-        if errors:st.error("; ".join(errors[:6]))
-        else:
-            try:
-                n=upsert_moderator_settings(pu,records);cached_settings.clear()
-                st.success(f"Saved persistent defaults for {n} moderators in {pu}.")
-            except Exception as exc:st.error(f"Could not save settings: {exc}")
+    if current:
+        st.success(f"Active WB70 plan: {len(current)} assignments · version {str(meta.get('snapshot_id',''))[:12]}")
+    else:
+        st.info("No weekly WB70 file has been published yet. Unlisted moderators default to WB20.")
+    uploader = st.text_input("Uploaded by (WFM name or initials)", key="wb70_uploader")
+    uploaded = st.file_uploader("Upload weekly WB70 Excel workbook (.xlsx)", type=["xlsx"], key="weekly_wb70_file")
+    if uploaded is not None:
+        try:
+            raw = uploaded.getvalue()
+            fingerprint = hashlib.sha256(raw).hexdigest()
+            entries, coverage, report = parse_wb70_workbook(raw)
+            st.dataframe(pd.DataFrame(report), width="stretch", hide_index=True)
+            st.caption(f"{len(entries)} WB70 assignments across {len(coverage)} date/PU combinations. Existing assignments outside these dates/PUs are preserved. Empty days in uploaded sheets clear earlier WB70 assignments for that day and PU.")
+            st.dataframe(pd.DataFrame(entries), width="stretch", hide_index=True)
+            roster, _ = load_remote_or_error()
+            unmatched = []
+            valid_roster = {(r['date'], r['pu'], normalize_name(r['name'])): r for r in roster}
+            for e in entries:
+                found = valid_roster.get((e['date'], e['pu'], normalize_name(e['name'])))
+                if not found:
+                    unmatched.append(e)
+                else:
+                    code = canonical_shift(found.get('shift_code'))
+                    actual_shift = ('Morning' if code in MORNING_SHIFT_CODES else
+                                    'Mid' if code == '1500-0000' else
+                                    'Night' if code == '2330-0800' else 'Custom')
+                    if actual_shift != e['shift']:
+                        unmatched.append(e)
+            if unmatched:
+                st.warning(f"{len(unmatched)} entries do not currently match a moderator and shift in the shared roster. They are still imported, but will not auto-apply unless the roster is corrected.")
+                st.dataframe(pd.DataFrame(unmatched), width="stretch", hide_index=True)
+            if fingerprint == st.session_state.get('wb70_last_published'):
+                st.info('This exact file has already been published during this browser session.')
+            elif st.button('Publish weekly WB70 assignments', type='primary'):
+                outcome = publish_wb70_plan(entries, coverage, uploader, expected_snapshot=str(meta.get('snapshot_id','')))
+                st.session_state['wb70_last_published'] = fingerprint
+                purge_caches()
+                st.success(f"Published {outcome['record_count']} current WB70 assignments.")
+                st.rerun()
+        except Exception as exc:
+            st.error(f"WB70 upload error: {exc}")
+    with st.expander("WB70 publication history / restore", expanded=False):
+        try:
+            revisions = list_wb70_versions()
+            if revisions:
+                st.dataframe(pd.DataFrame(revisions).tail(20), width="stretch", hide_index=True)
+                ids = [str(v['snapshot_id']) for v in reversed(revisions)]
+                chosen = st.selectbox('Published WB70 version', ids, key='wb70_restore')
+                if st.button('Restore WB70 version'):
+                    if not uploader.strip():
+                        st.error('Enter uploader name before restoring.')
+                    else:
+                        restore_wb70_version(chosen, uploader)
+                        purge_caches()
+                        st.rerun()
+        except Exception as exc:
+            st.error(f'Cannot read WB70 revision history: {exc}')
 
 
 # Morning staff on these alternate schedules are optimized together. Individual
@@ -336,7 +367,7 @@ def morning_group_label(codes):
     ) + ")"
 
 
-def shift_rule_defaults(selected_date, code):
+def shift_rule_defaults(selected_date, code, pu=None):
     times = parse_shift_code(code)
     if not times:
         raise ValueError(f"Invalid shift: {code}")
@@ -356,11 +387,13 @@ def shift_rule_defaults(selected_date, code):
         pressure_class = "Morning"
     if preset == "Custom" and 14 <= start.hour < 20:
         pressure_class = "Mid"
-    # Main shifts, including the extra Morning shifts, now all start breaks
-    # after 60 minutes and finish them >=60 minutes before their own shift end.
-    # All rules remain editable at plan time.
-    earliest = start + timedelta(minutes=60)
-    final = end - timedelta(minutes=60 if preset != "Custom" else 45)
+    # HLC default inside and boundary margins are 45–105; all other main
+    # PU shifts retain 60–90. All rules remain editable at plan time.
+    hlc = pu == "HLC" and preset in ("Morning", "Mid", "Night")
+    start_gap = 45 if hlc else 60
+    end_gap = 45 if hlc else (60 if preset != "Custom" else 45)
+    earliest = start + timedelta(minutes=start_gap)
+    final = end - timedelta(minutes=end_gap)
     if preset == "Morning":
         meal_start = start.replace(hour=12, minute=0)
         meal_end = start.replace(hour=14, minute=30)
@@ -400,7 +433,7 @@ def compute_breaks(selected_date, pu, code, chosen_rows, rule):
     optimization on a shared wall-clock axis. Each person keeps their own
     9-hour shift, first/last-break bounds and complete WFM shift timeline.
     """
-    defaults = shift_rule_defaults(selected_date, code)
+    defaults = shift_rule_defaults(selected_date, code, pu)
     anchor_start = defaults["start"]
     anchor_end = defaults["end"]
     common_earliest = resolve_clock(rule["earliest"], anchor_start)
@@ -425,7 +458,7 @@ def compute_breaks(selected_date, pu, code, chosen_rows, rule):
         actual_code = canonical_shift(row.get("ShiftCode") or code)
         if actual_code not in allowed:
             raise ValueError(f"{row['Name']}: shift {actual_code} is not included in the selected shift group.")
-        actual_defaults = shift_rule_defaults(selected_date, actual_code)
+        actual_defaults = shift_rule_defaults(selected_date, actual_code, pu)
         person_start, person_end = actual_defaults["start"], actual_defaults["end"]
         if person_end - person_start > timedelta(hours=13):
             raise ValueError(f"{row['Name']}: shifts longer than 13 hours are not supported.")
@@ -474,8 +507,32 @@ def compute_breaks(selected_date, pu, code, chosen_rows, rule):
             fixed_mins = int((fixed_dt - item["start"]).total_seconds() / 60)
             if fixed_mins % TIME_STEP:
                 raise ValueError(f"{name}: Fixed WB70 must be on a five-minute boundary.")
+            # A fixed WB70 is non-negotiable. The shift itself, however, must
+            # contain the WB70 and its full, unchanged duration.
+            shift_minutes = int((item["end"] - item["start"]).total_seconds() / 60)
+            if fixed_mins < 0 or fixed_mins + dur["WB70"] > shift_minutes:
+                raise ValueError(
+                    f"{name}: the uploaded fixed WB70 {fixed_clock} ({dur['WB70']} min) "
+                    f"falls outside the actual shift {item['code']}. "
+                    "This WB70 cannot be moved or shortened automatically."
+                )
         person_start = item["start"]
         person_end = item["end"]
+        # HLC final Morning break must fit inside overlap; Mid first break
+        # must START in overlap (it may end after 16:30, e.g. fixed WB70).
+        overlap_day = person_start.date()
+        overlap_start = datetime.combine(overlap_day, time(15, 0))
+        overlap_end = datetime.combine(overlap_day, time(16, 30))
+        first_overlap = (
+            (int((overlap_start-person_start).total_seconds()/60),
+             int((overlap_end-person_start).total_seconds()/60))
+            if pu == "HLC" and defaults["preset"] == "Mid" else None
+        )
+        last_overlap = (
+            (int((overlap_start-person_start).total_seconds()/60),
+             int((overlap_end-person_start).total_seconds()/60))
+            if pu == "HLC" and defaults["preset"] == "Morning" else None
+        )
         profile = (
             tuple((b, counts[b]) for b in BREAK_TYPES),
             tuple((b, dur[b]) for b in BREAK_TYPES),
@@ -485,9 +542,10 @@ def compute_breaks(selected_date, pu, code, chosen_rows, rule):
             int((meal_start - person_start).total_seconds() / 60),
             int((meal_end - person_start).total_seconds() / 60),
             fixed_mins, bool(rule["allow_wb70_second_half"]),
+            first_overlap, last_overlap, min_gap, max_gap,
         )
         if profile not in profile_cache:
-            patterns = build_candidate_patterns(
+            base_args = dict(
                 counts=counts, durations=dur,
                 total_shift_mins=profile[2], earliest_mins=profile[3],
                 final_mins=profile[4], meal_start_mins=profile[5],
@@ -495,13 +553,29 @@ def compute_breaks(selected_date, pu, code, chosen_rows, rule):
                 fixed_wb70_mins=fixed_mins,
                 allow_wb70_second_half=bool(rule["allow_wb70_second_half"]),
                 max_patterns=candidate_cap,
+                first_break_window=first_overlap,
+                last_break_window=last_overlap,
             )
+            # An uploaded fixed WB70 ALWAYS wins. Prefer layouts that obey
+            # normal rules; if that is impossible, relax restrictions around
+            # the WB70, and finally release secondary restrictions altogether.
+            patterns = []
+            applied_mode = "strict"
+            modes = ("strict", "neighbor", "all") if fixed_mins is not None else ("strict",)
+            for mode in modes:
+                patterns = build_candidate_patterns(**base_args, wb70_priority_mode=mode)
+                if patterns:
+                    applied_mode = mode
+                    break
             if not patterns:
-                raise ValueError(
-                    f"{name} ({item['code']}): no feasible five-break layout for "
-                    "this shift and rules. Check WB70, meal window and timing limits."
+                detail = (
+                    f"Fixed WB70 {fixed_clock} could not coexist with the other four nonoverlapping breaks inside their actual shift."
+                    if fixed_mins is not None else
+                    "Check the break window, inside time limits, meal window, and no-consecutive-Long rule."
                 )
-            profile_cache[profile] = patterns
+                raise ValueError(f"{name} ({item['code']}): no feasible five-break layout. {detail}")
+            profile_cache[profile] = (patterns, applied_mode)
+        applied_mode = profile_cache[profile][1]
         moderators.append({
             "Name": name, "Email": str(row.get("Email", "") or "").strip().lower(),
             "Counts": counts, "Durations": dur,
@@ -509,6 +583,9 @@ def compute_breaks(selected_date, pu, code, chosen_rows, rule):
             "Profile": profile, "ShiftCode": item["code"],
             "ShiftStart": person_start, "ShiftEnd": person_end,
             "Earliest": item["earliest"], "Final": item["final"],
+            "WB70PriorityMode": applied_mode,
+            "FixedWB70Start": (person_start + timedelta(minutes=fixed_mins)) if fixed_mins is not None else None,
+            "FixedWB70Duration": dur["WB70"] if fixed_mins is not None else 0,
         })
 
     tickets = [m for m in moderators if m["TicketModerator"]]
@@ -523,7 +600,7 @@ def compute_breaks(selected_date, pu, code, chosen_rows, rule):
     pattern_sets, vector_sets = [], []
     vector_cache = {}
     for mod in moderators:
-        patterns = profile_cache[mod["Profile"]]
+        patterns = profile_cache[mod["Profile"]][0]
         pattern_sets.append(patterns)
         offset = int((mod["ShiftStart"] - start).total_seconds() / 60)
         vector_key = (mod["Profile"], offset)
@@ -541,10 +618,20 @@ def compute_breaks(selected_date, pu, code, chosen_rows, rule):
             )
         vector_sets.append(vector_cache[vector_key])
 
-    ticket_availability = [
-        sum(m["ShiftStart"] <= start + timedelta(minutes=t) < m["ShiftEnd"] for m in tickets)
-        for t in timeline
-    ]
+    ticket_availability = []
+    ticket_forced_override = []
+    for minute in timeline:
+        now = start + timedelta(minutes=minute)
+        active_tickets = [m for m in tickets if m["ShiftStart"] <= now < m["ShiftEnd"]]
+        forced = [m for m in active_tickets if (
+            m["FixedWB70Start"] is not None
+            and m["FixedWB70Start"] <= now < m["FixedWB70Start"] + timedelta(minutes=m["FixedWB70Duration"])
+        )]
+        # Only when *every* on-duty ticket moderator is on an immovable
+        # fixed WB70 do we permit the unavoidable ticket coverage exception.
+        override = bool(active_tickets and len(forced) == len(active_tickets))
+        ticket_forced_override.append(override)
+        ticket_availability.append(len(active_tickets) + int(override))
     result = optimize_pattern_selection(
         moderators, pattern_sets, vector_sets, timeline, weights,
         ticket_available_counts=ticket_availability,
@@ -569,24 +656,45 @@ def compute_breaks(selected_date, pu, code, chosen_rows, rule):
             raise RuntimeError(f"Entitlement-validation error for {mod['Name']}")
         if seq[0]["Resource"] == "Meal":
             raise RuntimeError(f"Meal-first violation for {mod['Name']}")
+        if (seq[0]["Start"] < mod["ShiftStart"] or seq[-1]["Finish"] > mod["ShiftEnd"]
+                or any(a["Finish"] > b["Start"] for a, b in zip(seq, seq[1:]))):
+            raise RuntimeError(f"Invalid break overlap or shift boundary for {mod['Name']}")
+        if mod["FixedWB70Start"] is not None:
+            fixed_b = next(b for b in seq if b["Resource"] == "WB70")
+            if fixed_b["Start"] != mod["FixedWB70Start"] or (
+                fixed_b["Finish"]-fixed_b["Start"]
+            ) != timedelta(minutes=mod["FixedWB70Duration"]):
+                raise RuntimeError(f"Fixed WB70 priority validation failed for {mod['Name']}")
+
         gap_pairs = (
             [(mod["ShiftStart"], seq[0]["Start"]), (seq[-1]["Finish"], mod["ShiftEnd"])]
             + [(a["Finish"], b["Start"]) for a, b in zip(seq, seq[1:])]
         )
-        for a, b in gap_pairs:
-            gap = (b - a).total_seconds() / 60
-            if gap < min_gap - 0.01 or gap > max_gap + 0.01:
+        work_gaps = [(b-a).total_seconds()/60 for a,b in gap_pairs]
+        chronological_gaps = [work_gaps[0]] + work_gaps[2:] + [work_gaps[1]]
+        # Only fixed WB70 moderators whose usual rules proved infeasible may
+        # bypass inside/Long/overlap/window checks; all others are hard-checked.
+        if mod["WB70PriorityMode"] == "strict":
+            if any(g < min_gap - 0.01 or g > max_gap + 0.01 for g in work_gaps):
                 raise RuntimeError(f"Inside-gap validation failure for {mod['Name']}")
-        if seq[0]["Start"] < mod["Earliest"] or seq[-1]["Finish"] > mod["Final"]:
-            raise RuntimeError(f"Break-window validation failure for {mod['Name']}")
+            if any(a >= 90-0.01 and b >= 90-0.01 for a,b in zip(chronological_gaps, chronological_gaps[1:])):
+                raise RuntimeError(f"Consecutive Long inside times for {mod['Name']}")
+            if pu == 'HLC' and defaults['preset'] == 'Morning':
+                if seq[-1]['Start'] < datetime.combine(mod['ShiftStart'].date(), time(15,0)) or seq[-1]['Finish'] > datetime.combine(mod['ShiftStart'].date(), time(16,30)):
+                    raise RuntimeError(f"Morning overlap violation for {mod['Name']}")
+            if pu == 'HLC' and defaults['preset'] == 'Mid':
+                if not datetime.combine(mod['ShiftStart'].date(), time(15,0)) <= seq[0]['Start'] <= datetime.combine(mod['ShiftStart'].date(), time(16,30)):
+                    raise RuntimeError(f"Mid overlap violation for {mod['Name']}")
+            if seq[0]["Start"] < mod["Earliest"] or seq[-1]["Finish"] > mod["Final"]:
+                raise RuntimeError(f"Break-window validation failure for {mod['Name']}")
 
     if len(tickets) >= 2:
         ticket_names = {m["Name"] for m in tickets}
-        for minute in timeline:
+        for t_idx, minute in enumerate(timeline):
             now = start + timedelta(minutes=minute)
             available = sum(m["ShiftStart"] <= now < m["ShiftEnd"] for m in tickets)
             on_break = sum(b["Name"] in ticket_names and b["Start"] <= now < b["Finish"] for b in schedule)
-            if available and on_break >= available:
+            if available and on_break >= available and not ticket_forced_override[t_idx]:
                 raise RuntimeError("Ticket Moderator coverage validation failed")
 
     all_codes = sorted({m["ShiftCode"] for m in moderators})
@@ -608,6 +716,8 @@ def compute_breaks(selected_date, pu, code, chosen_rows, rule):
         ),
         "tickets": len(tickets), "used_fallback": bool(result["UsedFallback"]),
         "allow_wb70_second_half": bool(rule["allow_wb70_second_half"]),
+        "wb70_priority_overrides": [m["Name"] for m in moderators if m["WB70PriorityMode"] != "strict"],
+        "wb70_ticket_coverage_exception": any(ticket_forced_override),
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "pressure_summary": pd.DataFrame({
             "Time": [start + timedelta(minutes=t) for t in timeline],
@@ -623,7 +733,11 @@ def display_generated(payload):
     with info[2]:st.metric("Peak simultaneous WB70s",payload["peak_wb70"])
     with info[3]:st.metric("Ticket moderators",payload["tickets"])
     if payload["used_fallback"]:st.warning("Global optimizer did not converge to a MILP solution in time, so the fully feasible ticket-safe fallback was used.")
-    st.caption("All five breaks validated per included moderator. Meal is never first. Fixed WB70 overrides the optional first-half limit. Your generated plan is kept only in this browser session and is not uploaded to the site.")
+    st.caption("All five breaks are validated against the shift. Fixed uploaded WB70 times take precedence if standard rules conflict. All other moderators follow the normal inside, overlap and consecutive-Long restrictions. Generated plans remain in this browser session only.")
+    if payload.get("wb70_priority_overrides"):
+        st.warning("Fixed WB70 priority required relaxing secondary scheduling rules for: " + ", ".join(payload["wb70_priority_overrides"]))
+    if payload.get("wb70_ticket_coverage_exception"):
+        st.warning("Fixed WB70 assignments create unavoidable periods without Ticket Moderator coverage. Review these assignments before use.")
     cache=st.session_state.get("result_exports")
     if not cache or cache.get("timestamp") != payload["generated_at"]:
         cache={"timestamp":payload["generated_at"]}
@@ -777,36 +891,42 @@ def break_planner():
         st.dataframe(pd.DataFrame(conflicting),width="stretch",hide_index=True)
         return
     rows=[r for r in roster if r["date"]==chosen_date and r["pu"]==pu and canonical_shift(r["shift_code"]) in applicable_codes]
-    try:saved=cached_settings()
+    try:
+        weekly_wb70, wb70_meta = cached_wb70()
     except Exception as exc:
-        st.warning(f"Moderator defaults could not load; using WB20/ticket-off defaults: {exc}")
-        saved={}
-    choices=[]
-    for r in sorted(rows,key=lambda x:x["name"].casefold()):
-        opts=saved.get((pu,person_identity(r)),{})
-        choices.append({"Name":r["name"],"ShiftCode":canonical_shift(r["shift_code"]),"Shift":shift_label(r["shift_code"]),"Include":True,"WB70":bool(opts.get("wb70",False)),"Ticket Moderator":bool(opts.get("ticket",False)),"Fixed WB70 Start":str(opts.get("fixed_wb70", "") or ""),"WB70 Duration (mins)":str(opts.get("wb70_duration", "") or ""),"Identity":person_identity(r)})
+        st.error(f"Cannot load the published weekly WB70 plan: {exc}")
+        st.info("Refresh or check the shared Google Sheets connection before generating a plan. WB70 assignments must not be silently omitted.")
+        return
+    choices = []
+    for r in sorted(rows, key=lambda x: x["name"].casefold()):
+        shift_code = canonical_shift(r['shift_code'])
+        section = ('Morning' if shift_code in MORNING_SHIFT_CODES else
+                   'Mid' if shift_code == '1500-0000' else
+                   'Night' if shift_code == '2330-0800' else 'Custom')
+        assigned = match_wb70(weekly_wb70, chosen_date, pu, section, r['name'])
+        choices.append({
+            "Name":r["name"], "ShiftCode":shift_code, "Shift":shift_label(r["shift_code"]),
+            "Include":True, "WB70":assigned is not None, "Ticket Moderator":False,
+            "Fixed WB70 Start":str(assigned.get('fixed_start', '') or '') if assigned else '',
+            "WB70 Duration (mins)":str(assigned.get('duration', '') or '') if assigned else '',
+            "Identity":person_identity(r),
+        })
     st.markdown(f"### {len(choices)} moderators · {pu} · {shift_option_label(code)}")
     if code=="0730-1630":
         details=", ".join(f"{shift_label(c)}: {raw_shift_counts[c]}" for c in MORNING_SHIFT_CODES if raw_shift_counts[c])
         st.caption(f"Morning group shift composition — {details}. All staff are optimized together, but each retains their actual shift hours.")
-    st.caption("Automatic entitlements for every included moderator: 3 Shorts, 1 Meal, 1 Wellness. Check WB70 for 70-minute wellness; unchecked means WB20. Ticket coverage never allows all checked ticket moderators to be on break together. Use Include to exclude a temporary absence without changing the shared roster.")
-    edited=st.data_editor(pd.DataFrame(choices),width="stretch",hide_index=True,disabled=["Name","Identity","ShiftCode","Shift"],num_rows="fixed",column_config={"Identity":None,"ShiftCode":None,"Include":st.column_config.CheckboxColumn("Include"),"WB70":st.column_config.CheckboxColumn("WB70?"),"Ticket Moderator":st.column_config.CheckboxColumn("Ticket?"),"Fixed WB70 Start":st.column_config.TextColumn("Fixed WB70 HH:MM"),"WB70 Duration (mins)":st.column_config.TextColumn("WB70 duration (optional)")},key=f"plan_edit_{chosen_date}_{pu}_{code}_{meta.get('snapshot_id','')}")
-    if st.button("Save these WB70/Ticket choices as permanent PU defaults"):
-        updates=[{"identity":r["Identity"],"name":r["Name"],"wb70":bool(r["WB70"]),"ticket":bool(r["Ticket Moderator"]),"wb70_duration":str(r["WB70 Duration (mins)" ] or ""),"fixed_wb70":str(r["Fixed WB70 Start"] or "")} for _,r in edited.iterrows()]
-        try:
-            n=upsert_moderator_settings(pu,updates);cached_settings.clear()
-            st.success(f"Stored {n} moderator defaults for {pu}.")
-        except Exception as exc:st.error(f"Unable to store defaults: {exc}")
-    defaults=shift_rule_defaults(chosen_date,code)
+    st.caption("WB70 assignments and fixed times come from the published weekly workbook. A fixed WB70 takes priority if normal constraints conflict; other schedules retain the no-consecutive-Long rule. Per-plan overrides remain temporary.")
+    edited=st.data_editor(pd.DataFrame(choices),width="stretch",hide_index=True,disabled=["Name","Identity","ShiftCode","Shift"],num_rows="fixed",column_config={"Identity":None,"ShiftCode":None,"Include":st.column_config.CheckboxColumn("Include"),"WB70":st.column_config.CheckboxColumn("WB70?"),"Ticket Moderator":st.column_config.CheckboxColumn("Ticket?"),"Fixed WB70 Start":st.column_config.TextColumn("Fixed WB70 HH:MM"),"WB70 Duration (mins)":st.column_config.TextColumn("WB70 duration (optional)")},key=f"plan_edit_v4_{chosen_date}_{pu}_{code}_{meta.get('snapshot_id','')}_{wb70_meta.get('snapshot_id','')}")
+    defaults=shift_rule_defaults(chosen_date,code,pu)
     st.markdown("### Break rules")
     with st.expander("Shift-specific timing, durations and optimization rules",expanded=True):
-        st.caption("Defaults can be customized for this plan. In the Morning group, 08:00–17:00 and 09:00–18:00 staff use their own start/end times; earliest and latest break limits shift accordingly. Meal hours remain at the selected clock times.")
+        st.caption("Rules remain fully customizable. HLC uses 45–105 minute inside limits; other PUs retain 60–90 minutes. Fixed WB70 takes priority over conflicting timing and Long rules; all other breaks follow the selected rules.")
         a,b,c,d=st.columns(4)
         with a:
-            earliest=st.text_input("Earliest break allowed",defaults["earliest"].strftime("%H:%M"),key=f"early_rules_v2_{code}")
+            earliest=st.text_input("Earliest break allowed",defaults["earliest"].strftime("%H:%M"),key=f"early_rules_v4_{pu}_{code}")
             dur_short=st.number_input("Short length (min)",5,90,15,5,key=f"dshort_{code}")
         with b:
-            final=st.text_input("Final break must end by",defaults["final"].strftime("%H:%M"),key=f"final_rules_v2_{code}")
+            final=st.text_input("Final break must end by",defaults["final"].strftime("%H:%M"),key=f"final_rules_v4_{pu}_{code}")
             dur_meal=st.number_input("Meal length (min)",5,90,30,5,key=f"dmeal_{code}")
         with c:
             meal_start=st.text_input("Meal window start",defaults["meal_start"].strftime("%H:%M"),key=f"mstart_{code}")
@@ -815,9 +935,14 @@ def break_planner():
             meal_end=st.text_input("Meal window end",defaults["meal_end"].strftime("%H:%M"),key=f"mend_{code}")
             dur_wb70=st.number_input("WB70 length (min)",5,150,70,5,key=f"dwb70_{code}")
         c1,c2,c3=st.columns(3)
-        with c1:min_gap=st.number_input("Minimum inside time (min)",0,180,(60 if defaults["preset"]!="Custom" else 45),5,key=f"mingap_rules_v2_{code}")
-        with c2:max_gap=st.number_input("Maximum inside time (min)",0,240,(90 if defaults["preset"]!="Custom" else 105),5,key=f"maxgap_rules_v2_{code}")
-        with c3:allow_second=st.toggle("Allow WB70 in second half",value=False,key=f"wb_second_{code}",help="When OFF, non-fixed WB70 must finish by the shift midpoint. Fixed WB70 starts always override only this restriction.")
+        with c1:min_gap=st.number_input("Minimum inside time (min)",0,180,(45 if pu == "HLC" and defaults["preset"] != "Custom" else 60 if defaults["preset"] != "Custom" else 45),5,key=f"mingap_rules_v4_{pu}_{code}")
+        with c2:max_gap=st.number_input("Maximum inside time (min)",0,240,(105 if pu == "HLC" and defaults["preset"] != "Custom" else 90 if defaults["preset"] != "Custom" else 105),5,key=f"maxgap_rules_v4_{pu}_{code}")
+        with c3:allow_second=st.toggle(
+            "Allow WB70 in second half",
+            value=defaults["preset"] in ("Morning", "Night"),
+            key=f"wb_second_v1141_{pu}_{code}",
+            help="Default: Morning ON, Mid OFF, Night ON. All PUs. Customizable; fixed uploaded WB70 starts always take priority."
+        )
     rule={"earliest":earliest,"final":final,"meal_start":meal_start,"meal_end":meal_end,"min_gap":int(min_gap),"max_gap":int(max_gap),"allow_wb70_second_half":bool(allow_second),"durations":{"Short":int(dur_short),"Meal":int(dur_meal),"WB20":int(dur_wb20),"WB70":int(dur_wb70)}}
     if st.button("Generate optimized break schedule",type="primary"):
         try:
@@ -829,6 +954,7 @@ def break_planner():
                     selected["Email"] = email_by_identity.get(selected["Identity"], "")
                 payload=compute_breaks(chosen_date,pu,code,selection,rule)
                 payload["roster_snapshot_id"]=meta.get("snapshot_id", "")
+                payload["wb70_snapshot_id"]=wb70_meta.get("snapshot_id", "")
                 st.session_state["generated_payload"]=payload
                 st.session_state.pop("result_exports",None)
                 st.session_state.pop("individual_png_cache",None)
@@ -842,19 +968,21 @@ def break_planner():
             st.info("A generated schedule from a different date/PU/shift is still in this browser session. Select its original date/PU/shift or generate a new one.")
         elif payload.get("roster_snapshot_id")!=meta.get("snapshot_id", ""):
             st.warning("The shared roster changed after this schedule was generated. Regenerate before sharing to reflect the current roster.")
+        elif payload.get("wb70_snapshot_id")!=wb70_meta.get("snapshot_id", ""):
+            st.warning("The published weekly WB70 plan changed. Regenerate before sharing to reflect the current assignments.")
         else:display_generated(payload)
 
 
 def storage_help():
     st.title("Storage & Setup")
-    st.markdown("**Only the shared shift roster and moderator defaults are stored centrally.** Break plans, calendar entries, and previously generated images are never written to Google Sheets.")
+    st.markdown("**Only the shared shift roster and published weekly WB70 assignments are stored centrally.** Ticket/WB70 per-plan overrides, break plans and images are never stored.")
     try:
         title=connection_check()
         st.success(f"Connected to private Google Sheet: {title}")
     except Exception as exc:
         st.error(f"Google Sheets not connected: {exc}")
     st.markdown("### Setup")
-    st.markdown("1. Open your existing private Google Sheet, which already uses the Google service-account connection from V10.\n2. Keep the same `[break_planner] spreadsheet_id` and `[gcp_service_account]` secrets. V11 creates four new tabs: `Roster`, `RosterVersions`, `RosterControl`, and `ModeratorSettings`. The old `Schedules` and `Breaks` tabs are not used or deleted.\n3. Upload the shift schedule via **Shift Schedule Management**, check flagged duplicates, optionally correct them, and publish.\n4. Team leads then choose Date + PU + Shift on the **Break Planner** page.\n5. Share PNG images or individual cards to moderators through existing chats.")
+    st.markdown("1. Open your existing private Google Sheet, which already uses the Google service-account connection from V10.\n2. Keep the same `[break_planner] spreadsheet_id` and `[gcp_service_account]` secrets. The app uses roster tabs and three new WB70 tabs: `WB70Plan`, `WB70Versions`, and `WB70Control`. The old `Schedules` and `Breaks` tabs are not used or deleted.\n3. Publish the shift roster through **Shift Schedule Management**.\n4. Publish the WB70 workbook through **Weekly WB70 Upload**.\n5. Choose Date + PU + Shift, and download the same PNG, WFM, and TXT exports as before.")
     st.info("Security: A shared roster includes employee information. Set `access_password` in [break_planner] or use your organization's restricted Streamlit access. Only share the app with authorized WFM/leadership staff.")
     st.code('''[break_planner]\nspreadsheet_id = "YOUR_SHEET_ID"\naccess_password = "A_STRONG_TEAM_ACCESS_PASSWORD"\n\n[gcp_service_account]\n# Keep your existing JSON credential keys from V10 exactly as before.''',language="toml")
     st.markdown("### Permanent cutoff and PU mapping")
@@ -865,6 +993,6 @@ def storage_help():
 
 
 if page=="Shift Schedule Management":schedule_management()
-elif page=="Moderator Settings":settings_management()
+elif page=="Weekly WB70 Upload":weekly_wb70_management()
 elif page=="Storage & Help":storage_help()
 else:break_planner()
