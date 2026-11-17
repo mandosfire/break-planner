@@ -68,6 +68,9 @@ def build_candidate_patterns(
     fixed_wb70_mins,
     allow_wb70_second_half,
     max_patterns=MAX_PATTERNS_PER_PROFILE,
+    first_break_window=None,
+    last_break_window=None,
+    wb70_priority_mode="strict",
 ):
     """
     Generate complete individually-feasible schedules first.
@@ -82,6 +85,14 @@ def build_candidate_patterns(
       - optional first-half-only WB70 placement for non-fixed WB70s
       - fixed WB70 times override the first-half-only setting
       - 5-minute break-start grid
+      - no adjacent work/inside intervals of 90 minutes or more
+      - optional required first/last break windows
+
+    For a fixed uploaded WB70, the caller can retry in priority mode:
+      "neighbor": relax only rules on work intervals touching that WB70,
+                  and first/last break bounds if the WB70 is the endpoint.
+      "all": retain the fixed WB70, entitlement and actual shift boundaries,
+             but release timing/inside/Long/overlap constraints when needed.
 
     The global optimizer then only chooses WHICH valid candidate each moderator uses.
     This avoids the huge moderator x position x type x time binary formulation.
@@ -95,6 +106,23 @@ def build_candidate_patterns(
         return []
 
     meal_exception = counts.get("WB70", 0) > 0
+    if wb70_priority_mode not in ("strict", "neighbor", "all"):
+        raise ValueError(f"Unrecognized WB70 priority mode: {wb70_priority_mode}")
+    if wb70_priority_mode != "strict" and (not meal_exception or fixed_wb70_mins is None):
+        raise ValueError("WB70 priority relaxation requires an explicitly fixed WB70.")
+
+    def is_flexible_gap(order, position):
+        """position n is the gap immediately BEFORE break n (last=after final break)."""
+        if wb70_priority_mode == "all":
+            return True
+        if wb70_priority_mode == "neighbor":
+            return (position > 0 and order[position - 1] == "WB70") or (
+                position < len(order) and order[position] == "WB70"
+            )
+        return False
+
+    def gap_limits(order, position):
+        return (0, total_shift_mins) if is_flexible_gap(order, position) else (min_inside, max_inside)
 
     profile_key = (
         tuple((b, counts.get(b, 0)) for b in BREAK_TYPES),
@@ -108,6 +136,7 @@ def build_candidate_patterns(
         max_inside,
         fixed_wb70_mins,
         bool(allow_wb70_second_half),
+        first_break_window, last_break_window, wb70_priority_mode,
     )
     rng = random.Random(profile_seed(profile_key))
     rng.shuffle(orders)
@@ -138,24 +167,27 @@ def build_candidate_patterns(
                 b_type = order[position]
                 dur = durations[b_type]
 
+                this_min, this_max = gap_limits(order, position)
                 if position == 0:
-                    low = max(earliest_mins, min_inside)
-                    high = max_inside
+                    # Fixed WB70 is not moved to satisfy an earliest-break setting.
+                    earliest_limit = 0 if (wb70_priority_mode != "strict" and b_type == "WB70") or wb70_priority_mode == "all" else earliest_mins
+                    low = max(earliest_limit, this_min)
+                    high = this_max
                 else:
                     prev_type = order[position - 1]
                     prev_end = starts[-1] + durations[prev_type]
-                    low = prev_end + min_inside
-                    high = prev_end + max_inside
+                    low = prev_end + this_min
+                    high = prev_end + this_max
 
                 low = ceil_step(low)
-                high = floor_step(min(high, final_mins - dur, total_shift_mins - dur))
+                last_limit = total_shift_mins if (wb70_priority_mode == "all" or (wb70_priority_mode == "neighbor" and position == len(order) - 1 and b_type == "WB70")) else final_mins
+                high = floor_step(min(high, last_limit - dur, total_shift_mins - dur))
 
-                # Minimum room needed after the current break for all remaining
-                # breaks plus the final inside-time segment.
+                # Future work gaps adjoining fixed WB70 may be shortened.
                 remaining_types = order[position + 1 :]
                 minimum_after = (
                     sum(durations[x] for x in remaining_types)
-                    + min_inside * (len(remaining_types) + 1)
+                    + sum(gap_limits(order, j)[0] for j in range(position + 1, len(order) + 1))
                 )
                 high = min(high, floor_step(total_shift_mins - dur - minimum_after))
 
@@ -185,6 +217,28 @@ def build_candidate_patterns(
                     rng.shuffle(candidate_starts)
 
                 for start in candidate_starts:
+                    finish = start + dur
+                    if position == 0 and first_break_window is not None and wb70_priority_mode != "all" and not (wb70_priority_mode == "neighbor" and b_type == "WB70"):
+                        if start < first_break_window[0] or start > first_break_window[1]:
+                            continue
+                    if position == len(order) - 1 and last_break_window is not None and wb70_priority_mode != "all" and not (wb70_priority_mode == "neighbor" and b_type == "WB70"):
+                        if start < last_break_window[0] or finish > last_break_window[1]:
+                            continue
+
+                    # Every working stretch includes the interval from the
+                    # shift start to break 1 and the stretch after break 5.
+                    # Two 90+ minute stretches must never be consecutive.
+                    inside = start if position == 0 else start - (starts[-1] + durations[order[position - 1]])
+                    if position >= 1:
+                        previous_inside = (
+                            starts[0] if position == 1 else
+                            starts[-1] - (starts[-2] + durations[order[position - 2]])
+                        )
+                        if inside >= 90 and previous_inside >= 90 and not (
+                            is_flexible_gap(order, position - 1) or is_flexible_gap(order, position)
+                        ):
+                            continue
+
                     if b_type == "Meal" and not meal_exception:
                         if start < meal_start_mins or start + dur > meal_end_mins:
                             continue
@@ -192,9 +246,14 @@ def build_candidate_patterns(
                     if position == len(order) - 1:
                         end = start + dur
                         final_inside = total_shift_mins - end
-                        if end > final_mins:
+                        if end > last_limit:
                             continue
-                        if not (min_inside <= final_inside <= max_inside):
+                        last_gap_min, last_gap_max = gap_limits(order, len(order))
+                        if not (last_gap_min <= final_inside <= last_gap_max):
+                            continue
+                        if inside >= 90 and final_inside >= 90 and not (
+                            is_flexible_gap(order, position) or is_flexible_gap(order, len(order))
+                        ):
                             continue
 
                         full_starts = tuple(starts + [start])
