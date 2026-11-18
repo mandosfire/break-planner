@@ -45,7 +45,7 @@ from exclusions import is_excluded_moderator
 # It remains functional even when an older lark_base_export.py exists in GitHub.
 # No Lark API calls, no person lookup, and no server-side clipboard.
 HEADERS = ("Email", "Date", "PU", "Shift", "Break 1", "Break 2",
-           "Break 3", "Break 4", "Break 5", "Batch ID", "Status")
+           "Break 3", "Break 4", "Break 5", "Batch ID", "Status", "Shift Code")
 EMOJI_LABELS = {"Short": "☕ Short", "Meal": "🍽️ Meal", "WB20": "💙 Wellness", "WB70": "💙 Wellness"}
 MORNING_CODES = frozenset(("0730-1630", "0800-1700", "0900-1800"))
 EMAIL_PATTERN = re.compile(r"^[^\s@\t\r\n]+@[^\s@\t\r\n]+\.[^\s@\t\r\n]+$")
@@ -177,10 +177,34 @@ def build_lark_base_export(payload: dict) -> tuple[str, list[dict]]:
             seen_intervals.add((start, end, b["Resource"]))
             if b.get("ShiftStart") and isinstance(b["ShiftStart"], datetime) and b["ShiftStart"].date() != selected_date:
                 raise LarkExportError(f"{name}: mola satırındaki vardiya başlangıç tarihi planla uyuşmuyor.")
-            if b.get("ShiftCode") and _classify_shift(b["ShiftCode"]) != shift:
-                raise LarkExportError(f"{name}: gerçek vardiya kodu seçili vardiya grubu ile uyuşmuyor.")
+        # Take Shift Code from this moderator's own roster-backed break rows,
+        # never from the selected shift group (a Morning plan can mix codes).
+        # Every row must carry the same supported individual code; fail closed
+        # rather than silently filling missing or conflicting information.
+        actual_codes = []
+        for b in breaks:
+            raw_code = _clean_field(b.get("ShiftCode"), f"{name} Shift Code")
+            if not raw_code:
+                raise LarkExportError(f"{name}: gerçek Shift Code eksik. Kopyalama durduruldu.")
+            normalized_code = raw_code.upper().replace(" ", "").replace(":", "")
+            actual_codes.append(normalized_code)
+        if len(set(actual_codes)) != 1:
+            raise LarkExportError(
+                f"{name}: beş mola kaydında çelişen Shift Code değerleri var "
+                f"({', '.join(sorted(set(actual_codes)))}). Kopyalama durduruldu."
+            )
+        actual_code = actual_codes[0]
+        try:
+            actual_shift = _classify_shift(actual_code)
+        except LarkExportError as exc:
+            raise LarkExportError(f"{name}: desteklenmeyen Shift Code '{actual_code}'. Kopyalama durduruldu.") from exc
+        if actual_shift != shift:
+            raise LarkExportError(
+                f"{name}: gerçek Shift Code '{actual_code}' seçili {shift} grubu ile uyuşmuyor."
+            )
+
         cells = [_break_cell(b, selected_date) for b in breaks]
-        fields = [email, selected_date.isoformat(), pu, shift, *cells, batch_id, "Draft"]
+        fields = [email, selected_date.isoformat(), pu, shift, *cells, batch_id, "Draft", actual_code]
         if len(fields) != len(HEADERS):
             raise AssertionError("Lark Base export schema changed unexpectedly.")
         fields = [_clean_field(value, f"{name} sütunu {i+1}") for i, value in enumerate(fields)]
@@ -188,9 +212,9 @@ def build_lark_base_export(payload: dict) -> tuple[str, list[dict]]:
     if not rows:
         raise LarkExportError("Exporta dahil edilecek moderatör bulunamadı.")
     tsv = "\n".join("\t".join(row[key] for key in HEADERS) for row in rows)
-    # Structural invariant: exact 11 columns, one record per moderator.
-    if len(tsv.splitlines()) != len(rows) or any(len(line.split("\t")) != 11 for line in tsv.splitlines()):
-        raise AssertionError("TSV serialization failed 11-column invariant.")
+    # Structural invariant: exactly 12 columns, one record per moderator.
+    if len(tsv.splitlines()) != len(rows) or any(len(line.split("\t")) != 12 for line in tsv.splitlines()):
+        raise AssertionError("TSV serialization failed 12-column invariant.")
     return tsv, rows
 
 
@@ -1016,12 +1040,13 @@ def display_generated(payload):
     except LarkExportError as exc:
         st.warning(f"Lark Base kopyalama kullanılamıyor: {exc}")
     else:
-        st.caption(f"{len(lark_rows)} moderatör · 11 sütun · başlıksız TAB-ayrılmış veri · Status: Draft")
+        st.caption(f"{len(lark_rows)} moderatör · 12 sütun · başlıksız TAB-ayrılmış veri · Status: Draft")
         with st.expander("Lark Base önizlemesi (ilk 3 moderatör)", expanded=False):
             st.table(pd.DataFrame([{
                 "Email": r["Email"], "Date": r["Date"], "PU": r["PU"],
                 "Shift": r["Shift"], "Break 1": r["Break 1"],
-                "Batch ID": r["Batch ID"], "Status": r["Status"]
+                "Batch ID": r["Batch ID"], "Status": r["Status"],
+                "Shift Code": r["Shift Code"]
             } for r in lark_rows[:3]]))
         st.html(
             clipboard_button_html(lark_tsv, lark_rows[0]["Batch ID"]),
