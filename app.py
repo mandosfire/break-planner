@@ -752,14 +752,21 @@ def compute_breaks(selected_date, pu, code, chosen_rows, rule):
             fixed_mins = int((fixed_dt - item["start"]).total_seconds() / 60)
             if fixed_mins % TIME_STEP:
                 raise ValueError(f"{name}: Fixed WB70 must be on a five-minute boundary.")
-            # A fixed WB70 is non-negotiable. The shift itself, however, must
-            # contain the WB70 and its full, unchanged duration.
+            # The fixed start/duration cannot move, but core timing rules remain
+            # mandatory. Reject invalid uploads rather than silently override.
             shift_minutes = int((item["end"] - item["start"]).total_seconds() / 60)
             if fixed_mins < 0 or fixed_mins + dur["WB70"] > shift_minutes:
                 raise ValueError(
                     f"{name}: the uploaded fixed WB70 {fixed_clock} ({dur['WB70']} min) "
                     f"falls outside the actual shift {item['code']}. "
                     "This WB70 cannot be moved or shortened automatically."
+                )
+            if fixed_dt < item["earliest"] or fixed_dt + timedelta(minutes=dur["WB70"]) > item["final"]:
+                raise ValueError(
+                    f"{name} ({item['code']}): fixed WB70 {fixed_clock} ({dur['WB70']} min) "
+                    f"must be fully inside the selected break window "
+                    f"{item['earliest'].strftime('%H:%M')}–{item['final'].strftime('%H:%M')}. "
+                    "Fixed WB70 cannot override earliest/latest break limits."
                 )
         person_start = item["start"]
         person_end = item["end"]
@@ -801,9 +808,9 @@ def compute_breaks(selected_date, pu, code, chosen_rows, rule):
                 first_break_window=first_overlap,
                 last_break_window=last_overlap,
             )
-            # An uploaded fixed WB70 ALWAYS wins. Prefer layouts that obey
-            # normal rules; if that is impossible, relax restrictions around
-            # the WB70, and finally release secondary restrictions altogether.
+            # A fixed WB70 cannot move, but earliest/latest break limits and
+            # min/max inside times are never relaxed. Only secondary Long and
+            # HLC-overlap checks can be relaxed if the strict attempt fails.
             patterns = []
             applied_mode = "strict"
             modes = ("strict", "neighbor", "all") if fixed_mins is not None else ("strict",)
@@ -814,7 +821,10 @@ def compute_breaks(selected_date, pu, code, chosen_rows, rule):
                     break
             if not patterns:
                 detail = (
-                    f"Fixed WB70 {fixed_clock} could not coexist with the other four nonoverlapping breaks inside their actual shift."
+                    f"Fixed WB70 {fixed_clock} cannot fit with the required earliest/latest break "
+                    f"window and {min_gap}–{max_gap}-minute inside limits. "
+                    "Adjust the fixed WB70 assignment or customize the break rules; "
+                    "the planner will not override these limits."
                     if fixed_mins is not None else
                     "Check the break window, inside time limits, meal window, and no-consecutive-Long rule."
                 )
@@ -917,11 +927,14 @@ def compute_breaks(selected_date, pu, code, chosen_rows, rule):
         )
         work_gaps = [(b-a).total_seconds()/60 for a,b in gap_pairs]
         chronological_gaps = [work_gaps[0]] + work_gaps[2:] + [work_gaps[1]]
-        # Only fixed WB70 moderators whose usual rules proved infeasible may
-        # bypass inside/Long/overlap/window checks; all others are hard-checked.
+        # Non-negotiable for EVERY moderator, even when fixed WB70 priority
+        # relaxed secondary rules. Audit the final result independently of
+        # candidate pattern generation, including both shift-edge work gaps.
+        if any(g < min_gap - 0.01 or g > max_gap + 0.01 for g in work_gaps):
+            raise RuntimeError(f"Inside-gap validation failure for {mod['Name']}")
+        if seq[0]["Start"] < mod["Earliest"] or seq[-1]["Finish"] > mod["Final"]:
+            raise RuntimeError(f"Break-window validation failure for {mod['Name']}")
         if mod["WB70PriorityMode"] == "strict":
-            if any(g < min_gap - 0.01 or g > max_gap + 0.01 for g in work_gaps):
-                raise RuntimeError(f"Inside-gap validation failure for {mod['Name']}")
             if any(a >= 90-0.01 and b >= 90-0.01 for a,b in zip(chronological_gaps, chronological_gaps[1:])):
                 raise RuntimeError(f"Consecutive Long inside times for {mod['Name']}")
             if pu == 'HLC' and defaults['preset'] == 'Morning':
@@ -930,8 +943,6 @@ def compute_breaks(selected_date, pu, code, chosen_rows, rule):
             if pu == 'HLC' and defaults['preset'] == 'Mid':
                 if not datetime.combine(mod['ShiftStart'].date(), time(15,0)) <= seq[0]['Start'] <= datetime.combine(mod['ShiftStart'].date(), time(16,30)):
                     raise RuntimeError(f"Mid overlap violation for {mod['Name']}")
-            if seq[0]["Start"] < mod["Earliest"] or seq[-1]["Finish"] > mod["Final"]:
-                raise RuntimeError(f"Break-window validation failure for {mod['Name']}")
 
     if len(tickets) >= 2:
         ticket_names = {m["Name"] for m in tickets}
@@ -981,9 +992,9 @@ def display_generated(payload):
     with info[2]:st.metric("Peak simultaneous WB70s",payload["peak_wb70"])
     with info[3]:st.metric("Ticket moderators",payload["tickets"])
     if payload["used_fallback"]:st.warning("Global optimizer did not converge to a MILP solution in time, so the fully feasible ticket-safe fallback was used.")
-    st.caption("All five breaks are validated against the shift. Fixed uploaded WB70 times take precedence if standard rules conflict. All other moderators follow the normal inside, overlap and consecutive-Long restrictions. Generated plans remain in this browser session only.")
+    st.caption("All moderators, including those with fixed WB70, must satisfy the selected break window and inside-time limits. Fixed WB70 stays at its assigned time; secondary Long/overlap rules may be relaxed if needed. Generated plans remain in this browser session only.")
     if payload.get("wb70_priority_overrides"):
-        st.warning("Fixed WB70 priority required relaxing secondary scheduling rules for: " + ", ".join(payload["wb70_priority_overrides"]))
+        st.warning("Fixed WB70 required relaxing secondary Long or HLC overlap rules (never inside-time or break-window limits) for: " + ", ".join(payload["wb70_priority_overrides"]))
     if payload.get("wb70_ticket_coverage_exception"):
         st.warning("Fixed WB70 assignments create unavoidable periods without Ticket Moderator coverage. Review these assignments before use.")
     cache=st.session_state.get("result_exports")
@@ -1133,12 +1144,12 @@ def break_planner():
     if code=="0730-1630":
         details=", ".join(f"{shift_label(c)}: {raw_shift_counts[c]}" for c in MORNING_SHIFT_CODES if raw_shift_counts[c])
         st.caption(f"Morning group shift composition — {details}. All staff are optimized together, but each retains their actual shift hours.")
-    st.caption("WB70 assignments and fixed times come from the published weekly workbook. A fixed WB70 takes priority if normal constraints conflict; other schedules retain the no-consecutive-Long rule. Per-plan overrides remain temporary.")
+    st.caption("WB70 assignments and fixed times come from the published weekly workbook. Fixed WB70 times remain exact, but the break window and inside-time limits are mandatory for everyone. Per-plan overrides remain temporary.")
     edited=st.data_editor(pd.DataFrame(choices),width="stretch",hide_index=True,disabled=["Name","Identity","ShiftCode","Shift"],num_rows="fixed",column_config={"Identity":None,"ShiftCode":None,"Include":st.column_config.CheckboxColumn("Include"),"WB70":st.column_config.CheckboxColumn("WB70?"),"Ticket Moderator":st.column_config.CheckboxColumn("Ticket?"),"Fixed WB70 Start":st.column_config.TextColumn("Fixed WB70 HH:MM"),"WB70 Duration (mins)":st.column_config.TextColumn("WB70 duration (optional)")},key=f"plan_edit_v4_{chosen_date}_{pu}_{code}_{meta.get('snapshot_id','')}_{wb70_meta.get('snapshot_id','')}")
     defaults=shift_rule_defaults(chosen_date,code,pu)
     st.markdown("### Break rules")
     with st.expander("Shift-specific timing, durations and optimization rules",expanded=True):
-        st.caption("Rules remain fully customizable. HLC uses 45–105 minute inside limits; other PUs retain 60–90 minutes. Fixed WB70 takes priority over conflicting timing and Long rules; all other breaks follow the selected rules.")
+        st.caption("Rules remain fully customizable. HLC uses 45–105 minute inside limits; other PUs retain 60–90 minutes. Fixed WB70 never overrides minimum/maximum inside times or earliest/latest break windows, but may override secondary Long or HLC overlap requirements.")
         a,b,c,d=st.columns(4)
         with a:
             earliest=st.text_input("Earliest break allowed",defaults["earliest"].strftime("%H:%M"),key=f"early_rules_v4_{pu}_{code}")
