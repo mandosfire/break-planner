@@ -88,11 +88,16 @@ def build_candidate_patterns(
       - no adjacent work/inside intervals of 90 minutes or more
       - optional required first/last break windows
 
-    For a fixed uploaded WB70, the caller can retry in priority mode:
-      "neighbor": relax only rules on work intervals touching that WB70,
-                  and first/last break bounds if the WB70 is the endpoint.
-      "all": retain the fixed WB70, entitlement and actual shift boundaries,
-             but release timing/inside/Long/overlap constraints when needed.
+    A fixed WB70 has an immutable start and duration, but it NEVER overrides:
+      - earliest permitted first break / latest permitted final break end;
+      - minimum and maximum inside time, including shift-edge work intervals;
+      - physical shift boundaries, entitlements, and nonoverlapping breaks.
+
+    Only lower-priority constraints may be relaxed for fixed WB70:
+      "neighbor": consecutive-Long checks on intervals touching that WB70,
+                  and HLC first/last overlap placement if WB70 is the endpoint.
+      "all": consecutive-Long checks and HLC overlap-placement requirements.
+    Fixed WB70 also overrides the non-fixed second-half placement toggle.
 
     The global optimizer then only chooses WHICH valid candidate each moderator uses.
     This avoids the huge moderator x position x type x time binary formulation.
@@ -111,8 +116,8 @@ def build_candidate_patterns(
     if wb70_priority_mode != "strict" and (not meal_exception or fixed_wb70_mins is None):
         raise ValueError("WB70 priority relaxation requires an explicitly fixed WB70.")
 
-    def is_flexible_gap(order, position):
-        """position n is the gap immediately BEFORE break n (last=after final break)."""
+    def is_long_exception_gap(order, position):
+        """Only relax the secondary Long-consecutive check, NEVER inside lengths."""
         if wb70_priority_mode == "all":
             return True
         if wb70_priority_mode == "neighbor":
@@ -122,7 +127,8 @@ def build_candidate_patterns(
         return False
 
     def gap_limits(order, position):
-        return (0, total_shift_mins) if is_flexible_gap(order, position) else (min_inside, max_inside)
+        # Non-negotiable for all breaks, including a fixed uploaded WB70.
+        return min_inside, max_inside
 
     profile_key = (
         tuple((b, counts.get(b, 0)) for b in BREAK_TYPES),
@@ -169,9 +175,8 @@ def build_candidate_patterns(
 
                 this_min, this_max = gap_limits(order, position)
                 if position == 0:
-                    # Fixed WB70 is not moved to satisfy an earliest-break setting.
-                    earliest_limit = 0 if (wb70_priority_mode != "strict" and b_type == "WB70") or wb70_priority_mode == "all" else earliest_mins
-                    low = max(earliest_limit, this_min)
+                    # Core earliest-break bound is never overridden by WB70.
+                    low = max(earliest_mins, this_min)
                     high = this_max
                 else:
                     prev_type = order[position - 1]
@@ -180,10 +185,11 @@ def build_candidate_patterns(
                     high = prev_end + this_max
 
                 low = ceil_step(low)
-                last_limit = total_shift_mins if (wb70_priority_mode == "all" or (wb70_priority_mode == "neighbor" and position == len(order) - 1 and b_type == "WB70")) else final_mins
+                # Core final-break deadline is never overridden by WB70.
+                last_limit = final_mins
                 high = floor_step(min(high, last_limit - dur, total_shift_mins - dur))
 
-                # Future work gaps adjoining fixed WB70 may be shortened.
+                # Reserve enough room for every later mandatory inside gap.
                 remaining_types = order[position + 1 :]
                 minimum_after = (
                     sum(durations[x] for x in remaining_types)
@@ -235,7 +241,7 @@ def build_candidate_patterns(
                             starts[-1] - (starts[-2] + durations[order[position - 2]])
                         )
                         if inside >= 90 and previous_inside >= 90 and not (
-                            is_flexible_gap(order, position - 1) or is_flexible_gap(order, position)
+                            is_long_exception_gap(order, position - 1) or is_long_exception_gap(order, position)
                         ):
                             continue
 
@@ -252,7 +258,7 @@ def build_candidate_patterns(
                         if not (last_gap_min <= final_inside <= last_gap_max):
                             continue
                         if inside >= 90 and final_inside >= 90 and not (
-                            is_flexible_gap(order, position) or is_flexible_gap(order, len(order))
+                            is_long_exception_gap(order, position) or is_long_exception_gap(order, len(order))
                         ):
                             continue
 
